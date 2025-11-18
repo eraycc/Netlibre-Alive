@@ -16,6 +16,7 @@ const CONFIG = {
   adminUsername: process.env.ADMIN_USERNAME || 'admin',
   adminPassword: process.env.ADMIN_PASSWORD || 'admin123',
   jwtSecret: process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex'),
+  jwtSecret: process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex'),
   mysqlDsn: process.env.MYSQL_DSN || '',
   // 保活配置
   keepalive: {
@@ -672,7 +673,7 @@ app.delete('/api/accounts/:id', authenticate, async (req, res) => {
   await db.init();
 
   try {
-    const { id } = req.params;
+    const { id } = request.params;
     await db.run('DELETE FROM accounts WHERE id = ?', [id]);
     res.json({ message: '账号删除成功' });
   } catch (error) {
@@ -754,6 +755,7 @@ const HTML_TEMPLATE = `
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Netlib 保活控制面板</title>
+  <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
   <style>
     :root {
       --primary: #667eea;
@@ -1023,197 +1025,269 @@ const HTML_TEMPLATE = `
   <div class="toast" id="toast"></div>
 
   <script>
-    let token = localStorage.getItem('token');
-    const API = axios.create({ baseURL: '/api' });
-    
-    API.interceptors.request.use(config => {
-      if (token) config.headers.Authorization = 'Bearer ' + token;
-      return config;
-    });
+    // 确保脚本在 DOM 加载完成后执行
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', initApp);
+    } else {
+      initApp();
+    }
 
-    API.interceptors.response.use(
-      response => response,
-      error => {
-        if (error.response?.status === 401) {
-          logout();
+    function initApp() {
+      console.log('初始化应用...');
+      
+      let token = localStorage.getItem('token');
+      console.log('Token 从 localStorage 读取:', token ? '存在' : '不存在');
+
+      const API = axios.create({ 
+        baseURL: '/api',
+        timeout: 10000
+      });
+      
+      API.interceptors.request.use(config => {
+        if (token) {
+          config.headers.Authorization = 'Bearer ' + token;
+          console.log('添加 Authorization header');
         }
-        return Promise.reject(error);
-      }
-    );
+        return config;
+      });
 
-    // 登录
-    document.getElementById('loginForm').onsubmit = async (e) => {
-      e.preventDefault();
-      try {
-        const res = await API.post('/login', {
-          username: document.getElementById('username').value,
-          password: document.getElementById('password').value
+      API.interceptors.response.use(
+        response => response,
+        error => {
+          console.error('API 请求错误:', error);
+          if (error.response?.status === 401) {
+            logout();
+          }
+          return Promise.reject(error);
+        }
+      );
+
+      // 登录表单提交
+      const loginForm = document.getElementById('loginForm');
+      if (loginForm) {
+        loginForm.addEventListener('submit', async (e) => {
+          e.preventDefault();
+          console.log('登录表单提交');
+          
+          const username = document.getElementById('username').value;
+          const password = document.getElementById('password').value;
+          
+          if (!username || !password) {
+            alert('请输入用户名和密码');
+            return;
+          }
+
+          try {
+            console.log('发送登录请求...');
+            const res = await API.post('/login', { username, password });
+            console.log('登录响应:', res.data);
+            
+            if (res.data.token) {
+              token = res.data.token;
+              localStorage.setItem('token', token);
+              console.log('Token 已保存到 localStorage');
+              
+              // 切换界面
+              document.getElementById('loginContainer').style.display = 'none';
+              document.getElementById('dashboard').style.display = 'block';
+              console.log('界面已切换');
+              
+              // 加载数据
+              await loadDashboard();
+              await loadAccounts();
+              console.log('数据加载完成');
+            } else {
+              throw new Error('未返回 token');
+            }
+          } catch (err) {
+            console.error('登录失败:', err);
+            const errorMsg = err.response?.data?.error || err.message || '未知错误';
+            alert('登录失败: ' + errorMsg);
+          }
         });
-        token = res.data.token;
-        localStorage.setItem('token', token);
+      }
+
+      // 其他功能函数...
+      window.logout = function() {
+        console.log('执行登出');
+        token = null;
+        localStorage.removeItem('token');
+        location.reload();
+      };
+
+      window.loadDashboard = async function() {
+        try {
+          console.log('加载仪表板数据...');
+          const res = await API.get('/dashboard');
+          const data = res.data;
+          console.log('仪表板数据:', data);
+          
+          document.getElementById('totalAccounts').textContent = data.totalAccounts;
+          document.getElementById('activeAccounts').textContent = data.activeAccounts;
+          document.getElementById('successRate').textContent = data.successRate + '%';
+          document.getElementById('todayCount').textContent = data.todayHistory?.length || 0;
+          
+          // 填充历史记录
+          const tbody = document.getElementById('historyBody');
+          tbody.innerHTML = data.todayHistory?.map(h => \`
+            <tr>
+              <td>\${h.account_name}</td>
+              <td><span style="color:\${h.success?'var(--success)':'var(--danger)'}">\${h.success?'成功':'失败'}</span></td>
+              <td>\${h.message}</td>
+              <td>\${new Date(h.created_at).toLocaleString()}</td>
+            </tr>
+          \`).join('') || '<tr><td colspan="4">暂无记录</td></tr>';
+        } catch (err) {
+          console.error('加载仪表板失败:', err);
+          showToast('加载仪表板失败: ' + (err.message || '未知错误'), 'error');
+        }
+      };
+
+      window.loadAccounts = async function() {
+        try {
+          console.log('加载账号列表...');
+          const res = await API.get('/accounts');
+          console.log('账号数据:', res.data);
+          
+          const tbody = document.getElementById('accountsBody');
+          tbody.innerHTML = res.data.map(a => \`
+            <tr>
+              <td>\${a.name}</td>
+              <td>\${a.username}</td>
+              <td><span style="color:\${a.enabled?'var(--success)':'var(--danger)'}">\${a.enabled?'启用':'禁用'}</span></td>
+              <td>\${a.cron_expression || '每' + (a.interval_minutes || 60) + '分钟'}</td>
+              <td>\${a.last_keepalive ? new Date(a.last_keepalive).toLocaleString() : '从未运行'}</td>
+              <td>
+                <button class="btn btn-primary btn-sm" onclick="manualKeepalive(\${a.id})">立即执行</button>
+                <button class="btn btn-warning btn-sm" onclick="editAccount(\${a.id})">编辑</button>
+                <button class="btn btn-danger btn-sm" onclick="deleteAccount(\${a.id})">删除</button>
+              </td>
+            </tr>
+          \`).join('');
+        } catch (err) {
+          console.error('加载账号失败:', err);
+          showToast('加载账号失败: ' + (err.message || '未知错误'), 'error');
+        }
+      };
+
+      window.showAddModal = function() {
+        document.getElementById('addModal').classList.add('show');
+      };
+
+      window.closeModal = function(id) {
+        document.getElementById(id).classList.remove('show');
+      };
+
+      // 切换通知设置显示
+      window.toggleNotify = function(checkbox) {
+        document.getElementById('notifyChannels').style.display = checkbox.checked ? 'block' : 'none';
+      };
+
+      // 切换计划方式
+      const scheduleTypeSelect = document.getElementById('addScheduleType');
+      if (scheduleTypeSelect) {
+        scheduleTypeSelect.addEventListener('change', (e) => {
+          document.getElementById('intervalGroup').style.display = e.target.value === 'interval' ? 'block' : 'none';
+          document.getElementById('cronGroup').style.display = e.target.value === 'cron' ? 'block' : 'none';
+        });
+      }
+
+      // 添加账号
+      const addForm = document.getElementById('addForm');
+      if (addForm) {
+        addForm.addEventListener('submit', async (e) => {
+          e.preventDefault();
+          console.log('添加账号表单提交');
+          
+          try {
+            const notification = {
+              enabled: document.getElementById('enableNotify').checked,
+              telegram: {
+                enabled: document.getElementById('enableTelegram').checked,
+                botToken: document.getElementById('tgToken').value,
+                chatId: document.getElementById('tgChat').value
+              },
+              wechat: {
+                enabled: document.getElementById('enableWechat').checked,
+                webhook: document.getElementById('wechatWebhook').value
+              },
+              wxpusher: {
+                enabled: document.getElementById('enableWxPusher').checked,
+                appToken: document.getElementById('wxToken').value,
+                uid: document.getElementById('wxUid').value
+              },
+              dingtalk: {
+                enabled: document.getElementById('enableDingTalk').checked,
+                webhook: document.getElementById('dingWebhook').value,
+                secret: document.getElementById('dingSecret').value
+              }
+            };
+
+            const data = {
+              name: document.getElementById('addName').value,
+              username: document.getElementById('addUsername').value,
+              password: document.getElementById('addPassword').value,
+              cron_expression: document.getElementById('addScheduleType').value === 'cron' ? document.getElementById('addCron').value : null,
+              interval_minutes: document.getElementById('addScheduleType').value === 'interval' ? parseInt(document.getElementById('addInterval').value) : null,
+              notification
+            };
+
+            await API.post('/accounts', data);
+            showToast('账号添加成功', 'success');
+            closeModal('addModal');
+            loadAccounts();
+          } catch (err) {
+            console.error('添加账号失败:', err);
+            showToast('添加失败: ' + (err.response?.data?.error || err.message || '未知错误'), 'error');
+          }
+        });
+      }
+
+      window.manualKeepalive = async function(id) {
+        if (confirm('确定立即执行保活吗？')) {
+          try {
+            await API.post('/accounts/' + id + '/keepalive');
+            showToast('保活任务已触发', 'success');
+          } catch (err) {
+            console.error('执行保活失败:', err);
+            showToast('执行失败: ' + (err.response?.data?.error || err.message || '未知错误'), 'error');
+          }
+        }
+      };
+
+      window.deleteAccount = async function(id) {
+        if (confirm('确定删除该账号吗？')) {
+          try {
+            await API.delete('/accounts/' + id);
+            showToast('账号删除成功', 'success');
+            loadAccounts();
+          } catch (err) {
+            console.error('删除账号失败:', err);
+            showToast('删除失败: ' + (err.response?.data?.error || err.message || '未知错误'), 'error');
+          }
+        }
+      };
+
+      function showToast(message, type = 'info') {
+        const toast = document.getElementById('toast');
+        if (toast) {
+          toast.textContent = message;
+          toast.className = 'toast show ' + type;
+          setTimeout(() => toast.classList.remove('show'), 3000);
+        }
+      }
+
+      // 初始化检查
+      if (token) {
+        console.log('检测到已登录，自动进入控制面板');
         document.getElementById('loginContainer').style.display = 'none';
         document.getElementById('dashboard').style.display = 'block';
         loadDashboard();
         loadAccounts();
-      } catch (err) {
-        alert('登录失败: ' + err.response?.data?.error);
+        setInterval(loadDashboard, 30000); // 每30秒刷新
+      } else {
+        console.log('未检测到 token，显示登录界面');
       }
-    };
-
-    function logout() {
-      token = null;
-      localStorage.removeItem('token');
-      location.reload();
-    }
-
-    async function loadDashboard() {
-      try {
-        const res = await API.get('/dashboard');
-        const data = res.data;
-        document.getElementById('totalAccounts').textContent = data.totalAccounts;
-        document.getElementById('activeAccounts').textContent = data.activeAccounts;
-        document.getElementById('successRate').textContent = data.successRate + '%';
-        document.getElementById('todayCount').textContent = data.todayHistory?.length || 0;
-        
-        // 填充历史记录
-        const tbody = document.getElementById('historyBody');
-        tbody.innerHTML = data.todayHistory?.map(h => \`
-          <tr>
-            <td>\${h.account_name}</td>
-            <td><span style="color:\${h.success?'var(--success)':'var(--danger)'}">\${h.success?'成功':'失败'}</span></td>
-            <td>\${h.message}</td>
-            <td>\${new Date(h.created_at).toLocaleString()}</td>
-          </tr>
-        \`).join('') || '<tr><td colspan="4">暂无记录</td></tr>';
-      } catch (err) {
-        console.error('加载仪表板失败:', err);
-      }
-    }
-
-    async function loadAccounts() {
-      try {
-        const res = await API.get('/accounts');
-        const tbody = document.getElementById('accountsBody');
-        tbody.innerHTML = res.data.map(a => \`
-          <tr>
-            <td>\${a.name}</td>
-            <td>\${a.username}</td>
-            <td><span style="color:\${a.enabled?'var(--success)':'var(--danger)'}">\${a.enabled?'启用':'禁用'}</span></td>
-            <td>\${a.cron_expression || '每' + (a.interval_minutes || 60) + '分钟'}</td>
-            <td>\${a.last_keepalive ? new Date(a.last_keepalive).toLocaleString() : '从未运行'}</td>
-            <td>
-              <button class="btn btn-primary btn-sm" onclick="manualKeepalive(\${a.id})">立即执行</button>
-              <button class="btn btn-warning btn-sm" onclick="editAccount(\${a.id})">编辑</button>
-              <button class="btn btn-danger btn-sm" onclick="deleteAccount(\${a.id})">删除</button>
-            </td>
-          </tr>
-        \`).join('');
-      } catch (err) {
-        console.error('加载账号失败:', err);
-      }
-    }
-
-    function showAddModal() {
-      document.getElementById('addModal').classList.add('show');
-    }
-
-    function closeModal(id) {
-      document.getElementById(id).classList.remove('show');
-    }
-
-    // 切换通知设置显示
-    function toggleNotify(checkbox) {
-      document.getElementById('notifyChannels').style.display = checkbox.checked ? 'block' : 'none';
-    }
-
-    // 切换计划方式
-    document.getElementById('addScheduleType').onchange = (e) => {
-      document.getElementById('intervalGroup').style.display = e.target.value === 'interval' ? 'block' : 'none';
-      document.getElementById('cronGroup').style.display = e.target.value === 'cron' ? 'block' : 'none';
-    };
-
-    // 添加账号
-    document.getElementById('addForm').onsubmit = async (e) => {
-      e.preventDefault();
-      try {
-        const notification = {
-          enabled: document.getElementById('enableNotify').checked,
-          telegram: {
-            enabled: document.getElementById('enableTelegram').checked,
-            botToken: document.getElementById('tgToken').value,
-            chatId: document.getElementById('tgChat').value
-          },
-          wechat: {
-            enabled: document.getElementById('enableWechat').checked,
-            webhook: document.getElementById('wechatWebhook').value
-          },
-          wxpusher: {
-            enabled: document.getElementById('enableWxPusher').checked,
-            appToken: document.getElementById('wxToken').value,
-            uid: document.getElementById('wxUid').value
-          },
-          dingtalk: {
-            enabled: document.getElementById('enableDingTalk').checked,
-            webhook: document.getElementById('dingWebhook').value,
-            secret: document.getElementById('dingSecret').value
-          }
-        };
-
-        const data = {
-          name: document.getElementById('addName').value,
-          username: document.getElementById('addUsername').value,
-          password: document.getElementById('addPassword').value,
-          cron_expression: document.getElementById('addScheduleType').value === 'cron' ? document.getElementById('addCron').value : null,
-          interval_minutes: document.getElementById('addScheduleType').value === 'interval' ? parseInt(document.getElementById('addInterval').value) : null,
-          notification
-        };
-
-        await API.post('/accounts', data);
-        showToast('账号添加成功', 'success');
-        closeModal('addModal');
-        loadAccounts();
-      } catch (err) {
-        showToast('添加失败: ' + err.response?.data?.error, 'error');
-      }
-    };
-
-    async function manualKeepalive(id) {
-      if (confirm('确定立即执行保活吗？')) {
-        try {
-          await API.post('/accounts/' + id + '/keepalive');
-          showToast('保活任务已触发', 'success');
-        } catch (err) {
-          showToast('执行失败: ' + err.response?.data?.error, 'error');
-        }
-      }
-    }
-
-    async function deleteAccount(id) {
-      if (confirm('确定删除该账号吗？')) {
-        try {
-          await API.delete('/accounts/' + id);
-          showToast('账号删除成功', 'success');
-          loadAccounts();
-        } catch (err) {
-          showToast('删除失败: ' + err.response?.data?.error, 'error');
-        }
-      }
-    }
-
-    function showToast(message, type = 'info') {
-      const toast = document.getElementById('toast');
-      toast.textContent = message;
-      toast.className = 'toast show ' + type;
-      setTimeout(() => toast.classList.remove('show'), 3000);
-    }
-
-    // 初始化
-    if (token) {
-      document.getElementById('loginContainer').style.display = 'none';
-      document.getElementById('dashboard').style.display = 'block';
-      loadDashboard();
-      loadAccounts();
-      setInterval(loadDashboard, 30000); // 每30秒刷新
     }
   </script>
 </body>
