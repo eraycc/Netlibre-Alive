@@ -19,7 +19,7 @@ WORKDIR /app
 
 # 复制项目文件
 COPY package*.json ./
-RUN npm ci --only=production
+RUN npm install --legacy-peer-deps
 COPY app.js ./
 
 # 创建数据目录
