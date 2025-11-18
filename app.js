@@ -18,10 +18,21 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
 const MYSQL_DNS = process.env.MYSQL_DNS;
 const MYSQL_MAX_RETRY = parseInt(process.env.MYSQL_MAX_RETRY || '20');
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+const TIMEZONE = process.env.TIMEZONE || 'Asia/Shanghai';
+const DEBUG = process.env.DEBUG !== 'false'; // 默认开启
+
+// 调试日志函数
+function debugLog(...args) {
+  if (DEBUG) {
+    console.log(`[DEBUG ${new Date().toLocaleString('zh-CN', { timeZone: TIMEZONE })}]`, ...args);
+  }
+}
 
 // 数据库连接
 let db;
 let dbType = 'sqlite';
+let dbPool; // MySQL 连接池
+let retryCount = 0; // 当前重试次数
 
 // 解析 MySQL DNS
 function parseMySQLDNS(dns) {
@@ -44,7 +55,9 @@ function parseMySQLDNS(dns) {
     ssl: useSSL ? { rejectUnauthorized: false } : undefined,
     waitForConnections: true,
     connectionLimit: 10,
-    queueLimit: 0
+    queueLimit: 0,
+    enableKeepAlive: true,
+    keepAliveInitialDelay: 0
   };
 }
 
@@ -52,22 +65,81 @@ function parseMySQLDNS(dns) {
 async function connectWithRetry(config, maxRetries = MYSQL_MAX_RETRY) {
   for (let i = 0; i < maxRetries; i++) {
     try {
+      debugLog(`尝试连接 MySQL (${i + 1}/${maxRetries})...`);
       const pool = mysql.createPool(config);
       await pool.query('SELECT 1');
+      retryCount = 0; // 重置重试次数
       console.log(`✅ MySQL 连接成功 (尝试 ${i + 1}/${maxRetries})`);
       return pool;
     } catch (error) {
       const waitTime = Math.min(1000 * Math.pow(2, i), 30000);
       console.log(`⚠️ MySQL 连接失败 (尝试 ${i + 1}/${maxRetries}), ${waitTime}ms 后重试...`);
       console.log(`   错误信息: ${error.message}`);
+      debugLog('   详细错误:', error);
       
       if (i === maxRetries - 1) {
-        throw new Error(`MySQL 连接失败，已重试 ${maxRetries} 次`);
+        throw new Error(`MySQL 连接失败,已重试 ${maxRetries} 次: ${error.message}`);
       }
       
       await new Promise(resolve => setTimeout(resolve, waitTime));
     }
   }
+}
+
+// 数据库操作包装函数 - 带重试逻辑
+async function executeWithRetry(operation, operationName = '数据库操作') {
+  let lastError;
+  
+  for (let i = 0; i < MYSQL_MAX_RETRY; i++) {
+    try {
+      debugLog(`执行${operationName} (尝试 ${i + 1}/${MYSQL_MAX_RETRY})`);
+      const result = await operation();
+      
+      if (i > 0) {
+        console.log(`✅ ${operationName}成功 (尝试 ${i + 1}/${MYSQL_MAX_RETRY})`);
+        retryCount = 0; // 重置重试次数
+      }
+      
+      return result;
+    } catch (error) {
+      lastError = error;
+      const isConnectionError = error.code === 'ECONNRESET' || 
+                               error.code === 'PROTOCOL_CONNECTION_LOST' ||
+                               error.code === 'ECONNREFUSED' ||
+                               error.errno === 'ETIMEDOUT';
+      
+      if (!isConnectionError) {
+        // 非连接错误,直接抛出
+        debugLog(`${operationName}遇到非连接错误:`, error.message);
+        throw error;
+      }
+      
+      const waitTime = Math.min(1000 * Math.pow(2, i), 30000);
+      console.log(`⚠️ ${operationName}失败 (尝试 ${i + 1}/${MYSQL_MAX_RETRY}): ${error.message}`);
+      debugLog('   错误详情:', error);
+      
+      if (i < MYSQL_MAX_RETRY - 1) {
+        console.log(`   ${waitTime}ms 后重试...`);
+        
+        // 如果是 MySQL,尝试重新建立连接池
+        if (dbType === 'mysql' && dbPool) {
+          try {
+            debugLog('尝试重新建立 MySQL 连接池...');
+            await dbPool.end();
+            const config = parseMySQLDNS(MYSQL_DNS);
+            dbPool = await connectWithRetry(config, 3); // 使用较少的重试次数
+            db = dbPool;
+          } catch (reconnectError) {
+            debugLog('重新连接失败:', reconnectError.message);
+          }
+        }
+        
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+      }
+    }
+  }
+  
+  throw new Error(`${operationName}失败,已重试 ${MYSQL_MAX_RETRY} 次: ${lastError.message}`);
 }
 
 // 初始化数据库
@@ -78,59 +150,72 @@ async function initDatabase() {
       const config = parseMySQLDNS(MYSQL_DNS);
       console.log(`🔄 正在连接 MySQL: ${config.host}:${config.port}/${config.database}`);
       console.log(`   最大重试次数: ${MYSQL_MAX_RETRY}`);
-      db = await connectWithRetry(config);
+      console.log(`   时区设置: ${TIMEZONE}`);
+      debugLog('MySQL 配置:', { ...config, password: '***' });
+      
+      dbPool = await connectWithRetry(config);
+      db = dbPool;
       
       // 创建表
-      await db.query(`
-        CREATE TABLE IF NOT EXISTS accounts (
-          id INT AUTO_INCREMENT PRIMARY KEY,
-          username VARCHAR(255) NOT NULL UNIQUE,
-          password VARCHAR(255) NOT NULL,
-          enabled BOOLEAN DEFAULT true,
-          cron_expression VARCHAR(100) DEFAULT '0 0 */60 * *',
-          last_keepalive DATETIME,
-          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-        )
-      `);
+      await executeWithRetry(async () => {
+        await db.query(`
+          CREATE TABLE IF NOT EXISTS accounts (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            username VARCHAR(255) NOT NULL UNIQUE,
+            password VARCHAR(255) NOT NULL,
+            enabled BOOLEAN DEFAULT true,
+            cron_expression VARCHAR(100) DEFAULT '0 0 1 * *',
+            last_keepalive DATETIME,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+          )
+        `);
+      }, '创建 accounts 表');
       
-      await db.query(`
-        CREATE TABLE IF NOT EXISTS keepalive_logs (
-          id INT AUTO_INCREMENT PRIMARY KEY,
-          account_id INT NOT NULL,
-          username VARCHAR(255) NOT NULL,
-          success BOOLEAN NOT NULL,
-          message TEXT,
-          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-          INDEX idx_account_id (account_id),
-          INDEX idx_created_at (created_at)
-        )
-      `);
+      await executeWithRetry(async () => {
+        await db.query(`
+          CREATE TABLE IF NOT EXISTS keepalive_logs (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            account_id INT NOT NULL,
+            username VARCHAR(255) NOT NULL,
+            success BOOLEAN NOT NULL,
+            message TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_account_id (account_id),
+            INDEX idx_created_at (created_at)
+          )
+        `);
+      }, '创建 keepalive_logs 表');
       
-      await db.query(`
-        CREATE TABLE IF NOT EXISTS notification_channels (
-          id INT AUTO_INCREMENT PRIMARY KEY,
-          name VARCHAR(50) NOT NULL UNIQUE,
-          type VARCHAR(50) NOT NULL,
-          enabled BOOLEAN DEFAULT true,
-          config JSON NOT NULL,
-          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-        )
-      `);
+      await executeWithRetry(async () => {
+        await db.query(`
+          CREATE TABLE IF NOT EXISTS notification_channels (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(50) NOT NULL UNIQUE,
+            type VARCHAR(50) NOT NULL,
+            enabled BOOLEAN DEFAULT true,
+            config JSON NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+          )
+        `);
+      }, '创建 notification_channels 表');
       
-      await db.query(`
-        CREATE TABLE IF NOT EXISTS system_settings (
-          key_name VARCHAR(100) PRIMARY KEY,
-          value TEXT,
-          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-        )
-      `);
+      await executeWithRetry(async () => {
+        await db.query(`
+          CREATE TABLE IF NOT EXISTS system_settings (
+            key_name VARCHAR(100) PRIMARY KEY,
+            value TEXT,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+          )
+        `);
+      }, '创建 system_settings 表');
       
       console.log('✅ MySQL 表初始化完成');
       
     } catch (error) {
       console.error('❌ MySQL 初始化失败:', error.message);
+      debugLog('MySQL 初始化详细错误:', error);
       console.log('🔄 降级使用 SQLite');
       dbType = 'sqlite';
     }
@@ -146,7 +231,7 @@ async function initDatabase() {
         username TEXT NOT NULL UNIQUE,
         password TEXT NOT NULL,
         enabled INTEGER DEFAULT 1,
-        cron_expression TEXT DEFAULT '0 0 */60 * *',
+        cron_expression TEXT DEFAULT '0 0 1 * *',
         last_keepalive DATETIME,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -185,28 +270,38 @@ async function initDatabase() {
     `);
     
     console.log('✅ SQLite 初始化成功');
+    console.log(`   时区设置: ${TIMEZONE}`);
   }
 }
 
 // 数据库查询封装
 async function query(sql, params = []) {
-  if (dbType === 'mysql') {
-    const [rows] = await db.query(sql, params);
-    return rows;
-  } else {
-    const all = promisify(db.all.bind(db));
-    return await all(sql, params);
-  }
+  return await executeWithRetry(async () => {
+    if (dbType === 'mysql') {
+      const [rows] = await db.query(sql, params);
+      return rows;
+    } else {
+      const all = promisify(db.all.bind(db));
+      return await all(sql, params);
+    }
+  }, `查询: ${sql.substring(0, 50)}...`);
 }
 
 async function execute(sql, params = []) {
-  if (dbType === 'mysql') {
-    const [result] = await db.query(sql, params);
-    return result;
-  } else {
-    const run = promisify(db.run.bind(db));
-    return await run(sql, params);
-  }
+  return await executeWithRetry(async () => {
+    if (dbType === 'mysql') {
+      const [result] = await db.query(sql, params);
+      return result;
+    } else {
+      const run = promisify(db.run.bind(db));
+      return await run(sql, params);
+    }
+  }, `执行: ${sql.substring(0, 50)}...`);
+}
+
+// 获取当前时间 (使用配置的时区)
+function getCurrentTime() {
+  return new Date().toLocaleString('zh-CN', { timeZone: TIMEZONE });
 }
 
 // 中间件
@@ -271,6 +366,7 @@ function requireAuth(req, res, next) {
 // 登录 API
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body;
+  debugLog('登录尝试:', { username });
   
   if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
     const token = generateToken(username);
@@ -279,8 +375,10 @@ app.post('/api/login', (req, res) => {
       maxAge: 7 * 24 * 60 * 60 * 1000,
       sameSite: 'strict'
     });
+    console.log(`✅ 用户 ${username} 登录成功 - ${getCurrentTime()}`);
     res.json({ success: true });
   } else {
+    console.log(`❌ 用户 ${username} 登录失败 - ${getCurrentTime()}`);
     res.status(401).json({ error: '用户名或密码错误' });
   }
 });
@@ -288,6 +386,7 @@ app.post('/api/login', (req, res) => {
 // 登出 API
 app.post('/api/logout', (req, res) => {
   res.clearCookie('auth_token');
+  debugLog('用户登出');
   res.json({ success: true });
 });
 
@@ -309,16 +408,20 @@ app.get('/api/auth/check', (req, res) => {
 // 账号管理 API
 app.get('/api/accounts', requireAuth, async (req, res) => {
   try {
+    debugLog('获取账号列表');
     const accounts = await query('SELECT id, username, enabled, cron_expression, last_keepalive, created_at FROM accounts ORDER BY id DESC');
     res.json(accounts);
   } catch (error) {
+    console.error('❌ 获取账号列表失败:', error.message);
+    debugLog('详细错误:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
 app.post('/api/accounts', requireAuth, async (req, res) => {
   try {
-    const { username, password, cron_expression = '0 0 */60 * *' } = req.body;
+    const { username, password, cron_expression = '0 0 1 * *' } = req.body;
+    debugLog('添加账号:', { username, cron_expression });
     
     if (!username || !password) {
       return res.status(400).json({ error: '用户名和密码不能为空' });
@@ -330,11 +433,15 @@ app.post('/api/accounts', requireAuth, async (req, res) => {
     
     await execute(sql, [username, password, cron_expression]);
     
+    console.log(`✅ 账号添加成功: ${username} - ${getCurrentTime()}`);
+    
     // 重新加载定时任务
     await loadCronJobs();
     
     res.json({ success: true });
   } catch (error) {
+    console.error('❌ 添加账号失败:', error.message);
+    debugLog('详细错误:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -343,6 +450,7 @@ app.put('/api/accounts/:id', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
     const { username, password, cron_expression, enabled } = req.body;
+    debugLog('更新账号:', { id, username, cron_expression, enabled });
     
     const updates = [];
     const params = [];
@@ -373,11 +481,15 @@ app.put('/api/accounts/:id', requireAuth, async (req, res) => {
     
     await execute(sql, params);
     
+    console.log(`✅ 账号更新成功: ID=${id} - ${getCurrentTime()}`);
+    
     // 重新加载定时任务
     await loadCronJobs();
     
     res.json({ success: true });
   } catch (error) {
+    console.error('❌ 更新账号失败:', error.message);
+    debugLog('详细错误:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -385,14 +497,20 @@ app.put('/api/accounts/:id', requireAuth, async (req, res) => {
 app.delete('/api/accounts/:id', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
+    debugLog('删除账号:', { id });
+    
     await execute('DELETE FROM accounts WHERE id = ?', [id]);
     await execute('DELETE FROM keepalive_logs WHERE account_id = ?', [id]);
+    
+    console.log(`✅ 账号删除成功: ID=${id} - ${getCurrentTime()}`);
     
     // 重新加载定时任务
     await loadCronJobs();
     
     res.json({ success: true });
   } catch (error) {
+    console.error('❌ 删除账号失败:', error.message);
+    debugLog('详细错误:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -401,6 +519,8 @@ app.delete('/api/accounts/:id', requireAuth, async (req, res) => {
 app.get('/api/logs', requireAuth, async (req, res) => {
   try {
     const { limit = 100, offset = 0 } = req.query;
+    debugLog('获取日志:', { limit, offset });
+    
     const logs = await query(
       'SELECT * FROM keepalive_logs ORDER BY created_at DESC LIMIT ? OFFSET ?',
       [parseInt(limit), parseInt(offset)]
@@ -408,6 +528,8 @@ app.get('/api/logs', requireAuth, async (req, res) => {
     const [{ total }] = await query('SELECT COUNT(*) as total FROM keepalive_logs');
     res.json({ logs, total });
   } catch (error) {
+    console.error('❌ 获取日志失败:', error.message);
+    debugLog('详细错误:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -415,6 +537,7 @@ app.get('/api/logs', requireAuth, async (req, res) => {
 app.delete('/api/logs', requireAuth, async (req, res) => {
   try {
     const { ids } = req.body;
+    debugLog('删除日志:', { ids });
     
     if (!ids || !Array.isArray(ids) || ids.length === 0) {
       return res.status(400).json({ error: '请提供要删除的日志ID' });
@@ -423,8 +546,11 @@ app.delete('/api/logs', requireAuth, async (req, res) => {
     const placeholders = ids.map(() => '?').join(',');
     await execute(`DELETE FROM keepalive_logs WHERE id IN (${placeholders})`, ids);
     
+    console.log(`✅ 删除 ${ids.length} 条日志成功 - ${getCurrentTime()}`);
     res.json({ success: true });
   } catch (error) {
+    console.error('❌ 删除日志失败:', error.message);
+    debugLog('详细错误:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -432,6 +558,8 @@ app.delete('/api/logs', requireAuth, async (req, res) => {
 // 统计数据 API
 app.get('/api/stats', requireAuth, async (req, res) => {
   try {
+    debugLog('获取统计数据');
+    
     const [{ total_accounts }] = await query('SELECT COUNT(*) as total_accounts FROM accounts');
     const [{ enabled_accounts }] = await query('SELECT COUNT(*) as enabled_accounts FROM accounts WHERE enabled = 1');
     const [{ total_keepalives }] = await query('SELECT COUNT(*) as total_keepalives FROM keepalive_logs');
@@ -470,6 +598,8 @@ app.get('/api/stats', requireAuth, async (req, res) => {
       recent_logs: recentLogs
     });
   } catch (error) {
+    console.error('❌ 获取统计数据失败:', error.message);
+    debugLog('详细错误:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -477,6 +607,7 @@ app.get('/api/stats', requireAuth, async (req, res) => {
 // 通知渠道 API
 app.get('/api/notifications', requireAuth, async (req, res) => {
   try {
+    debugLog('获取通知渠道列表');
     const channels = await query('SELECT * FROM notification_channels ORDER BY id');
     const result = channels.map(ch => ({
       ...ch,
@@ -484,6 +615,8 @@ app.get('/api/notifications', requireAuth, async (req, res) => {
     }));
     res.json(result);
   } catch (error) {
+    console.error('❌ 获取通知渠道失败:', error.message);
+    debugLog('详细错误:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -491,12 +624,16 @@ app.get('/api/notifications', requireAuth, async (req, res) => {
 app.post('/api/notifications', requireAuth, async (req, res) => {
   try {
     const { name, type, config, enabled = true } = req.body;
+    debugLog('添加通知渠道:', { name, type, enabled });
     
     const sql = 'INSERT INTO notification_channels (name, type, config, enabled) VALUES (?, ?, ?, ?)';
     await execute(sql, [name, type, JSON.stringify(config), enabled ? 1 : 0]);
     
+    console.log(`✅ 通知渠道添加成功: ${name} - ${getCurrentTime()}`);
     res.json({ success: true });
   } catch (error) {
+    console.error('❌ 添加通知渠道失败:', error.message);
+    debugLog('详细错误:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -505,6 +642,7 @@ app.put('/api/notifications/:id', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
     const { name, type, config, enabled } = req.body;
+    debugLog('更新通知渠道:', { id, name, type, enabled });
     
     const updates = [];
     const params = [];
@@ -530,8 +668,11 @@ app.put('/api/notifications/:id', requireAuth, async (req, res) => {
     const sql = `UPDATE notification_channels SET ${updates.join(', ')} WHERE id = ?`;
     
     await execute(sql, params);
+    console.log(`✅ 通知渠道更新成功: ID=${id} - ${getCurrentTime()}`);
     res.json({ success: true });
   } catch (error) {
+    console.error('❌ 更新通知渠道失败:', error.message);
+    debugLog('详细错误:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -539,9 +680,14 @@ app.put('/api/notifications/:id', requireAuth, async (req, res) => {
 app.delete('/api/notifications/:id', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
+    debugLog('删除通知渠道:', { id });
+    
     await execute('DELETE FROM notification_channels WHERE id = ?', [id]);
+    console.log(`✅ 通知渠道删除成功: ID=${id} - ${getCurrentTime()}`);
     res.json({ success: true });
   } catch (error) {
+    console.error('❌ 删除通知渠道失败:', error.message);
+    debugLog('详细错误:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -550,6 +696,8 @@ app.delete('/api/notifications/:id', requireAuth, async (req, res) => {
 app.post('/api/notifications/:id/test', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
+    debugLog('测试通知渠道:', { id });
+    
     const [channel] = await query('SELECT * FROM notification_channels WHERE id = ?', [id]);
     
     if (!channel) {
@@ -557,10 +705,13 @@ app.post('/api/notifications/:id/test', requireAuth, async (req, res) => {
     }
     
     const config = typeof channel.config === 'string' ? JSON.parse(channel.config) : channel.config;
-    const result = await sendNotification(channel.type, config, '测试通知', '这是来自 Netlib 保活系统的测试通知。如果您收到此消息，说明您的通知设置正常工作！');
+    const result = await sendNotification(channel.type, config, '测试通知', '这是来自 Netlib 保活系统的测试通知。如果您收到此消息,说明您的通知设置正常工作!');
     
+    console.log(`${result.success ? '✅' : '❌'} 测试通知发送${result.success ? '成功' : '失败'}: ${channel.name} - ${getCurrentTime()}`);
     res.json({ success: result.success, message: result.message });
   } catch (error) {
+    console.error('❌ 测试通知失败:', error.message);
+    debugLog('详细错误:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -569,6 +720,8 @@ app.post('/api/notifications/:id/test', requireAuth, async (req, res) => {
 app.post('/api/keepalive/:id', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
+    debugLog('手动执行保活:', { id });
+    
     const [account] = await query('SELECT * FROM accounts WHERE id = ?', [id]);
     
     if (!account) {
@@ -578,26 +731,28 @@ app.post('/api/keepalive/:id', requireAuth, async (req, res) => {
     const result = await performKeepalive(account);
     res.json(result);
   } catch (error) {
+    console.error('❌ 手动保活失败:', error.message);
+    debugLog('详细错误:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
 // 保活逻辑
 async function performKeepalive(account) {
-  console.log(`\n🚀 开始保活账号: ${account.username}`);
+  console.log(`\n🚀 开始保活账号: ${account.username} - ${getCurrentTime()}`);
+  debugLog('账号信息:', { id: account.id, username: account.username, cron: account.cron_expression });
   
   const browser = await chromium.launch({ 
-  headless: true,
-  args: [
-    '--no-sandbox',
-    '--disable-setuid-sandbox', 
-    '--disable-dev-shm-usage',
-    '--disable-gpu',
-    '--disable-web-security'
-  ]
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox', 
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--disable-web-security'
+    ]
   });
 
-  
   let page;
   let result = { success: false, message: '' };
   
@@ -608,6 +763,7 @@ async function performKeepalive(account) {
     console.log(`📱 ${account.username} - 正在访问网站...`);
     await page.goto('https://www.netlib.re/', { waitUntil: 'networkidle' });
     await page.waitForTimeout(3000);
+    debugLog(`${account.username} - 网站加载完成`);
     
     console.log(`🔑 ${account.username} - 点击登录按钮...`);
     await page.click('text=Login', { timeout: 5000 });
@@ -628,38 +784,60 @@ async function performKeepalive(account) {
     await page.waitForTimeout(5000);
     
     const pageContent = await page.content();
+    debugLog(`${account.username} - 页面内容长度: ${pageContent.length}`);
     
     if (pageContent.includes('exclusive owner') || pageContent.includes(account.username)) {
-      console.log(`✅ ${account.username} - 保活成功`);
+      console.log(`✅ ${account.username} - 保活成功 - ${getCurrentTime()}`);
       result.success = true;
       result.message = `✅ ${account.username} 保活成功`;
     } else {
-      console.log(`❌ ${account.username} - 保活失败`);
+      console.log(`❌ ${account.username} - 保活失败 - ${getCurrentTime()}`);
       result.message = `❌ ${account.username} 保活失败`;
+      debugLog(`${account.username} - 页面未包含预期内容`);
     }
     
   } catch (e) {
-    console.log(`❌ ${account.username} - 保活异常: ${e.message}`);
+    console.log(`❌ ${account.username} - 保活异常: ${e.message} - ${getCurrentTime()}`);
+    debugLog(`${account.username} - 详细异常:`, e);
     result.message = `❌ ${account.username} 保活异常: ${e.message}`;
   } finally {
     if (page) await page.close();
     await browser.close();
+    debugLog(`${account.username} - 浏览器已关闭`);
   }
   
-  // 记录日志
-  await execute(
-    'INSERT INTO keepalive_logs (account_id, username, success, message) VALUES (?, ?, ?, ?)',
-    [account.id, account.username, result.success ? 1 : 0, result.message]
-  );
+  // 记录日志 - 使用重试逻辑
+  try {
+    await execute(
+      'INSERT INTO keepalive_logs (account_id, username, success, message) VALUES (?, ?, ?, ?)',
+      [account.id, account.username, result.success ? 1 : 0, result.message]
+    );
+    debugLog(`${account.username} - 日志记录成功`);
+  } catch (error) {
+    console.error(`❌ ${account.username} - 记录日志失败:`, error.message);
+    debugLog('详细错误:', error);
+  }
   
-  // 更新最后保活时间
-  const updateSql = dbType === 'mysql' 
-    ? 'UPDATE accounts SET last_keepalive = NOW() WHERE id = ?'
-    : 'UPDATE accounts SET last_keepalive = datetime("now") WHERE id = ?';
-  await execute(updateSql, [account.id]);
+  // 更新最后保活时间 - 使用重试逻辑
+  try {
+    const updateSql = dbType === 'mysql' 
+      ? 'UPDATE accounts SET last_keepalive = NOW() WHERE id = ?'
+      : 'UPDATE accounts SET last_keepalive = datetime("now") WHERE id = ?';
+    await execute(updateSql, [account.id]);
+    debugLog(`${account.username} - 更新保活时间成功`);
+  } catch (error) {
+    console.error(`❌ ${account.username} - 更新保活时间失败:`, error.message);
+    debugLog('详细错误:', error);
+  }
   
   // 发送通知
-  await sendNotifications(result.message);
+  try {
+    await sendNotifications(result.message);
+    debugLog(`${account.username} - 通知发送完成`);
+  } catch (error) {
+    console.error(`❌ ${account.username} - 发送通知失败:`, error.message);
+    debugLog('详细错误:', error);
+  }
   
   return result;
 }
@@ -668,19 +846,27 @@ async function performKeepalive(account) {
 async function sendNotifications(message) {
   try {
     const channels = await query('SELECT * FROM notification_channels WHERE enabled = 1');
+    debugLog(`发送通知到 ${channels.length} 个渠道`);
     
     for (const channel of channels) {
-      const config = typeof channel.config === 'string' ? JSON.parse(channel.config) : channel.config;
-      await sendNotification(channel.type, config, 'Netlib 保活通知', message);
+      try {
+        const config = typeof channel.config === 'string' ? JSON.parse(channel.config) : channel.config;
+        await sendNotification(channel.type, config, 'Netlib 保活通知', message);
+        debugLog(`通知发送成功: ${channel.name}`);
+      } catch (error) {
+        console.error(`发送通知到 ${channel.name} 失败:`, error.message);
+        debugLog('详细错误:', error);
+      }
     }
   } catch (error) {
-    console.error('发送通知失败:', error);
+    console.error('获取通知渠道失败:', error.message);
+    debugLog('详细错误:', error);
   }
 }
 
 // 发送单个通知
 async function sendNotification(type, config, title, message) {
-  const timestamp = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+  const timestamp = getCurrentTime();
   
   try {
     switch (type) {
@@ -696,7 +882,8 @@ async function sendNotification(type, config, title, message) {
         return { success: false, message: '未知的通知类型' };
     }
   } catch (error) {
-    console.error(`发送 ${type} 通知失败:`, error);
+    console.error(`发送 ${type} 通知失败:`, error.message);
+    debugLog('详细错误:', error);
     return { success: false, message: error.message };
   }
 }
@@ -783,32 +970,59 @@ async function sendDingTalkNotification(config, title, message, timestamp) {
 const cronJobs = new Map();
 
 async function loadCronJobs() {
+  console.log(`\n🔄 重新加载定时任务 - ${getCurrentTime()}`);
+  
   // 清除所有现有任务
-  cronJobs.forEach(job => job.stop());
+  cronJobs.forEach((job, accountId) => {
+    job.stop();
+    debugLog(`停止定时任务: 账号ID=${accountId}`);
+  });
   cronJobs.clear();
   
   // 加载所有启用的账号
-  const accounts = await query('SELECT * FROM accounts WHERE enabled = 1');
-  
-  for (const account of accounts) {
-    try {
-      const job = cron.schedule(account.cron_expression, async () => {
-        console.log(`⏰ 定时任务触发: ${account.username}`);
-        await performKeepalive(account);
-      }, {
-        scheduled: true,
-        timezone: 'Asia/Shanghai'
-      });
-      
-      cronJobs.set(account.id, job);
-      console.log(`✅ 已加载定时任务: ${account.username} (${account.cron_expression})`);
-    } catch (error) {
-      console.error(`❌ 加载定时任务失败: ${account.username}`, error);
+  try {
+    const accounts = await query('SELECT * FROM accounts WHERE enabled = 1');
+    console.log(`📋 找到 ${accounts.length} 个启用的账号`);
+    
+    for (const account of accounts) {
+      try {
+        debugLog(`加载定时任务: ${account.username} (${account.cron_expression})`);
+        
+        // 验证 cron 表达式
+        if (!cron.validate(account.cron_expression)) {
+          console.error(`❌ 无效的 Cron 表达式: ${account.username} - ${account.cron_expression}`);
+          continue;
+        }
+        
+        const job = cron.schedule(account.cron_expression, async () => {
+          console.log(`\n⏰ 定时任务触发: ${account.username} - ${getCurrentTime()}`);
+          try {
+            await performKeepalive(account);
+          } catch (error) {
+            console.error(`❌ 定时任务执行失败: ${account.username}`, error.message);
+            debugLog('详细错误:', error);
+          }
+        }, {
+          scheduled: true,
+          timezone: TIMEZONE
+        });
+        
+        cronJobs.set(account.id, job);
+        console.log(`✅ 已加载定时任务: ${account.username} (${account.cron_expression}) [时区: ${TIMEZONE}]`);
+      } catch (error) {
+        console.error(`❌ 加载定时任务失败: ${account.username}`, error.message);
+        debugLog('详细错误:', error);
+      }
     }
+    
+    console.log(`✅ 定时任务加载完成,共 ${cronJobs.size} 个任务\n`);
+  } catch (error) {
+    console.error('❌ 加载定时任务失败:', error.message);
+    debugLog('详细错误:', error);
   }
 }
 
-// HTML 页面
+// HTML 页面 (修改部分)
 app.get('/', (req, res) => {
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -909,12 +1123,29 @@ app.get('/', (req, res) => {
       background: linear-gradient(135deg, var(--primary-color), var(--secondary-color));
       color: white;
       text-align: center;
+      position: relative;
     }
     
     .sidebar-header h3 {
       margin: 0;
       font-size: 20px;
       font-weight: 700;
+    }
+    
+    .sidebar-close {
+      display: none;
+      position: absolute;
+      right: 10px;
+      top: 10px;
+      background: rgba(255,255,255,0.2);
+      border: none;
+      color: white;
+      width: 30px;
+      height: 30px;
+      border-radius: 5px;
+      cursor: pointer;
+      font-size: 20px;
+      line-height: 1;
     }
     
     .sidebar-menu {
@@ -1040,6 +1271,17 @@ app.get('/', (req, res) => {
       cursor: pointer;
     }
     
+    .sidebar-overlay {
+      display: none;
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(0,0,0,0.5);
+      z-index: 999;
+    }
+    
     @media (max-width: 768px) {
       .sidebar {
         left: -250px;
@@ -1047,6 +1289,14 @@ app.get('/', (req, res) => {
       
       .sidebar.show {
         left: 0;
+      }
+      
+      .sidebar-close {
+        display: block;
+      }
+      
+      .sidebar-overlay.show {
+        display: block;
       }
       
       .main-content {
@@ -1121,9 +1371,15 @@ app.get('/', (req, res) => {
 
   <!-- 主应用 -->
   <div id="appContainer" class="app-container">
+    <!-- 侧边栏遮罩 -->
+    <div class="sidebar-overlay" id="sidebarOverlay"></div>
+    
     <!-- 侧边栏 -->
     <div class="sidebar" id="sidebar">
       <div class="sidebar-header">
+        <button class="sidebar-close" id="sidebarClose">
+          <i class="bi bi-x"></i>
+        </button>
         <h3><i class="bi bi-shield-check"></i> Netlib</h3>
       </div>
       <div class="sidebar-menu">
@@ -1314,8 +1570,8 @@ app.get('/', (req, res) => {
             </div>
             <div class="mb-3">
               <label class="form-label">Cron 表达式</label>
-              <input type="text" class="form-control" id="accountCron" value="0 0 */60 * *" required>
-              <small class="text-muted">默认每60天执行一次</small>
+              <input type="text" class="form-control" id="accountCron" value="0 0 1 * *" required>
+              <small class="text-muted">默认每月1号凌晨执行 (时区: ${TIMEZONE})</small>
             </div>
             <div class="mb-3 form-check">
               <input type="checkbox" class="form-check-input" id="accountEnabled" checked>
@@ -1441,6 +1697,9 @@ app.get('/', (req, res) => {
         };
         document.getElementById('pageTitle').textContent = titles[page];
         
+        // 关闭移动端侧边栏
+        closeSidebar();
+        
         if (page === 'dashboard') loadDashboard();
         if (page === 'accounts') loadAccounts();
         if (page === 'logs') loadLogs();
@@ -1448,10 +1707,19 @@ app.get('/', (req, res) => {
       });
     });
     
-    // 移动端菜单切换
+    // 移动端菜单控制
     document.getElementById('menuToggle').addEventListener('click', () => {
-      document.getElementById('sidebar').classList.toggle('show');
+      document.getElementById('sidebar').classList.add('show');
+      document.getElementById('sidebarOverlay').classList.add('show');
     });
+    
+    document.getElementById('sidebarClose').addEventListener('click', closeSidebar);
+    document.getElementById('sidebarOverlay').addEventListener('click', closeSidebar);
+    
+    function closeSidebar() {
+      document.getElementById('sidebar').classList.remove('show');
+      document.getElementById('sidebarOverlay').classList.remove('show');
+    }
     
     // 加载仪表板
     async function loadDashboard() {
@@ -1517,7 +1785,7 @@ app.get('/', (req, res) => {
       currentAccountId = null;
       document.getElementById('accountModalTitle').textContent = '添加账号';
       document.getElementById('accountForm').reset();
-      document.getElementById('accountCron').value = '0 0 */60 * *';
+      document.getElementById('accountCron').value = '0 0 1 * *';
       document.getElementById('accountEnabled').checked = true;
     }
     
@@ -1605,6 +1873,7 @@ app.get('/', (req, res) => {
         const result = await res.json();
         alert(result.message || '保活完成');
         loadAccounts();
+        loadLogs();
       } catch (error) {
         alert('保活失败: ' + error.message);
       }
@@ -1883,7 +2152,11 @@ app.get('/', (req, res) => {
 // 启动服务器
 async function start() {
   try {
-    console.log('\n===== Application Startup at ' + new Date().toLocaleString() + ' =====\n');
+    console.log('\n===== Application Startup =====');
+    console.log(`启动时间: ${getCurrentTime()}`);
+    console.log(`时区设置: ${TIMEZONE}`);
+    console.log(`DEBUG 模式: ${DEBUG ? '开启' : '关闭'}`);
+    console.log('===============================\n');
     
     await initDatabase();
     await loadCronJobs();
@@ -1893,10 +2166,13 @@ async function start() {
       console.log(`📊 数据库类型: ${dbType.toUpperCase()}`);
       console.log(`👤 管理员账号: ${ADMIN_USERNAME}`);
       console.log(`🔄 MySQL 最大重试次数: ${MYSQL_MAX_RETRY}`);
+      console.log(`🌍 时区: ${TIMEZONE}`);
+      console.log(`🐛 DEBUG 模式: ${DEBUG ? '开启' : '关闭'}`);
       console.log('\n==========================================\n');
     });
   } catch (error) {
     console.error('❌ 启动失败:', error);
+    debugLog('详细错误:', error);
     process.exit(1);
   }
 }
