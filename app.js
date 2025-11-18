@@ -103,6 +103,8 @@ class Database {
       this.connection = new sqlite3.Database(dbPath, (err) => {
         if (err) reject(err);
         else {
+          // 启用外键约束（如果需要）
+          this.connection.run('PRAGMA foreign_keys = ON');
           console.log('✅ 使用 SQLite 数据库');
           resolve();
         }
@@ -139,6 +141,11 @@ class Database {
   }
 
   async createTables() {
+    // 修复: 根据数据库类型设置 updated_at
+    const onUpdateTimestamp = this.type === 'mysql' 
+      ? 'ON UPDATE CURRENT_TIMESTAMP' 
+      : '';
+    
     const accountsTable = `
       CREATE TABLE IF NOT EXISTS accounts (
         id INTEGER PRIMARY KEY ${this.type === 'mysql' ? 'AUTO_INCREMENT' : 'AUTOINCREMENT'},
@@ -162,7 +169,7 @@ class Database {
         dingtalk_webhook VARCHAR(255),
         dingtalk_secret VARCHAR(255),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ${onUpdateTimestamp}
       )
     `;
 
@@ -184,7 +191,7 @@ class Database {
         browser_headless BOOLEAN DEFAULT TRUE,
         browser_timeout INTEGER DEFAULT 30000,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ${onUpdateTimestamp}
       )
     `;
 
@@ -193,8 +200,10 @@ class Database {
       await this.query(historyTable);
       await this.query(settingsTable);
       
-      // 插入默认设置
-      const defaultSettings = `INSERT OR IGNORE INTO settings (id) VALUES (1)`;
+      // 修复: 根据数据库类型选择正确的插入语法
+      const defaultSettings = this.type === 'mysql' 
+        ? `INSERT IGNORE INTO settings (id) VALUES (1)` 
+        : `INSERT OR IGNORE INTO settings (id) VALUES (1)`;
       await this.query(defaultSettings);
       
       console.log('✅ 数据库表创建成功');
@@ -542,14 +551,22 @@ app.get('/api/dashboard', authenticate, async (req, res) => {
     const activeAccounts = await db.query('SELECT COUNT(*) as count FROM accounts WHERE enabled = 1');
     const totalHistory = await db.query('SELECT COUNT(*) as count FROM history');
     const successHistory = await db.query('SELECT COUNT(*) as count FROM history WHERE success = 1');
-    const todayHistory = await db.query(`
+    
+    // 修复: 根据数据库类型使用不同的日期函数
+    const dateCondition = db.type === 'mysql' 
+      ? `DATE(h.created_at) = CURDATE()` 
+      : `DATE(h.created_at) = DATE('now')`;
+
+    const todayHistorySQL = `
       SELECT h.*, a.name as account_name 
       FROM history h 
       JOIN accounts a ON h.account_id = a.id 
-      WHERE DATE(h.created_at) = DATE('now') 
+      WHERE ${dateCondition}
       ORDER BY h.created_at DESC 
       LIMIT 20
-    `);
+    `;
+    
+    const todayHistory = await db.query(todayHistorySQL);
 
     const total = totalAccounts[0].count;
     const active = activeAccounts[0].count;
