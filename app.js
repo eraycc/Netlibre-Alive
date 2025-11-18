@@ -587,9 +587,19 @@ async function performKeepalive(account) {
   console.log(`\n🚀 开始保活账号: ${account.username}`);
   
   const browser = await chromium.launch({ 
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
+  headless: true,
+  executablePath: process.env.PLAYWRIGHT_BROWSERS_PATH ? 
+    `/ms-playwright/chromium-*/chrome-linux/chrome` : 
+    undefined,
+  args: [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-gpu',
+    '--disable-web-security'
+  ]
   });
+
   
   let page;
   let result = { success: false, message: '' };
