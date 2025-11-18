@@ -35,7 +35,7 @@ WORKDIR /app
 COPY package*.json ./
 
 # 安装 Node.js 依赖
-RUN npm ci --only=production
+RUN npm install --legacy-peer-deps
 
 # 安装 Playwright 浏览器
 RUN npx playwright install chromium --with-deps
