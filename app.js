@@ -1,1345 +1,1403 @@
+#!/usr/bin/env node
+/**
+ * Netlib Auto Login Keep-Alive Control Panel
+ * Web-based management interface for the keep-alive system
+ */
+
 const express = require('express');
-const { chromium } = require('playwright');
-const mysql = require('mysql2/promise');
-const sqlite3 = require('sqlite3').verbose();
+const cors = require('cors');
 const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
 const cron = require('node-cron');
 const axios = require('axios');
+const { chromium } = require('playwright');
 const crypto = require('crypto');
 const { URL } = require('url');
 
-// ============================================================================
-// 配置和环境变量
-// ============================================================================
-const CONFIG = {
-  port: process.env.PORT || 3000,
-  adminUsername: process.env.ADMIN_USERNAME || 'admin',
-  adminPassword: process.env.ADMIN_PASSWORD || 'admin123',
-  jwtSecret: process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex'),
-  jwtSecret: process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex'),
-  mysqlDsn: process.env.MYSQL_DSN || '',
-  // 保活配置
-  keepalive: {
-    defaultInterval: parseInt(process.env.DEFAULT_INTERVAL) || 60 * 60 * 1000, // 默认60分钟
-    timeout: 30000,
-  }
-};
+// Database setup
+let db;
+let dbType;
 
-// ============================================================================
-// 数据库层
-// ============================================================================
-class Database {
-  constructor() {
-    this.type = 'sqlite';
-    this.connection = null;
-    this.pool = null;
-  }
-
-  async init() {
-    if (CONFIG.mysqlDsn) {
-      try {
-        await this.initMySQL();
-        this.type = 'mysql';
-        console.log('✅ 使用 MySQL 数据库');
-      } catch (error) {
-        console.error('❌ MySQL 连接失败，回退到 SQLite:', error.message);
-        await this.initSQLite();
-      }
-    } else {
-      await this.initSQLite();
-    }
-    await this.createTables();
-  }
-
-  async initMySQL() {
-    const parsed = this.parseMySQLDSN(CONFIG.mysqlDsn);
-    if (!parsed) throw new Error('无效的 MySQL DSN 格式');
-
-    this.pool = mysql.createPool({
-      host: parsed.host,
-      port: parsed.port,
-      user: parsed.username,
-      password: parsed.password,
-      database: parsed.database,
-      ssl: parsed.ssl,
-      waitForConnections: true,
-      connectionLimit: 10,
-      queueLimit: 0,
-      enableKeepAlive: true,
-      keepAliveInitialDelay: 0,
-    });
-
-    // 测试连接
-    await this.pool.query('SELECT 1');
-  }
-
-  parseMySQLDSN(dsn) {
-    try {
-      const url = new URL(dsn);
-      return {
-        host: url.hostname,
-        port: url.port || 3306,
-        username: decodeURIComponent(url.username),
-        password: decodeURIComponent(url.password),
-        database: url.pathname.replace('/', ''),
-        ssl: url.searchParams.get('ssl') === 'true'
-      };
-    } catch (e) {
+// Parse MySQL DSN
+function parseMySQLDSN(dsn) {
+  try {
+    const url = new URL(dsn);
+    
+    if (!['mysql:', 'mysql+pymysql:'].includes(url.protocol)) {
       return null;
     }
-  }
-
-  async initSQLite() {
-    return new Promise((resolve, reject) => {
-      const dbPath = process.env.SQLITE_PATH || './data/netlib.db';
-      const path = require('path');
-      const fs = require('fs');
-      
-      // 确保目录存在
-      const dir = path.dirname(dbPath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
-
-      this.connection = new sqlite3.Database(dbPath, (err) => {
-        if (err) reject(err);
-        else {
-          // 启用外键约束（如果需要）
-          this.connection.run('PRAGMA foreign_keys = ON');
-          console.log('✅ 使用 SQLite 数据库');
-          resolve();
-        }
-      });
-    });
-  }
-
-  async query(sql, params = []) {
-    if (this.type === 'mysql') {
-      const [results] = await this.pool.query(sql, params);
-      return results;
-    } else {
-      return new Promise((resolve, reject) => {
-        this.connection.all(sql, params, (err, rows) => {
-          if (err) reject(err);
-          else resolve(rows);
-        });
-      });
-    }
-  }
-
-  async run(sql, params = []) {
-    if (this.type === 'mysql') {
-      const [result] = await this.pool.query(sql, params);
-      return result;
-    } else {
-      return new Promise((resolve, reject) => {
-        this.connection.run(sql, params, function(err) {
-          if (err) reject(err);
-          else resolve({ insertId: this.lastID, changes: this.changes });
-        });
-      });
-    }
-  }
-
-  async createTables() {
-    // 修复: 根据数据库类型设置 updated_at
-    const onUpdateTimestamp = this.type === 'mysql' 
-      ? 'ON UPDATE CURRENT_TIMESTAMP' 
-      : '';
     
-    const accountsTable = `
+    const useSSL = url.searchParams.get('ssl') === 'true';
+    let username = decodeURIComponent(url.username || 'root');
+    
+    // Handle TiDB username format (user.cluster)
+    if (username.includes('.')) {
+      username = username.split('.').pop();
+    }
+    
+    return {
+      type: 'mysql',
+      host: url.hostname || 'localhost',
+      port: parseInt(url.port) || 3306,
+      database: url.pathname.substring(1) || 'netlib_keepalive',
+      user: username,
+      password: decodeURIComponent(url.password || ''),
+      ssl: useSSL ? { rejectUnauthorized: false } : false
+    };
+  } catch (error) {
+    console.error('Error parsing MySQL DSN:', error);
+    return null;
+  }
+}
+
+// Initialize database
+async function initDatabase() {
+  const MYSQL_DSN = process.env.MYSQL_DSN;
+  
+  if (MYSQL_DSN) {
+    const config = parseMySQLDSN(MYSQL_DSN);
+    if (config) {
+      dbType = 'mysql';
+      const mysql = require('mysql2/promise');
+      
+      const pool = mysql.createPool({
+        host: config.host,
+        port: config.port,
+        user: config.user,
+        password: config.password,
+        database: config.database,
+        ssl: config.ssl,
+        waitForConnections: true,
+        connectionLimit: 10,
+        queueLimit: 0,
+        enableKeepAlive: true,
+        keepAliveInitialDelay: 0
+      });
+      
+      db = {
+        async query(sql, params) {
+          const [rows] = await pool.execute(sql, params || []);
+          return rows;
+        },
+        async execute(sql, params) {
+          await pool.execute(sql, params || []);
+        }
+      };
+      
+      console.log(`✅ Connected to MySQL: ${config.host}:${config.port}/${config.database}`);
+    }
+  }
+  
+  if (!db) {
+    dbType = 'sqlite';
+    const sqlite3 = require('sqlite3').verbose();
+    const { promisify } = require('util');
+    
+    const sqliteDb = new sqlite3.Database('./data/netlib_keepalive.db');
+    
+    db = {
+      async query(sql, params) {
+        const all = promisify(sqliteDb.all.bind(sqliteDb));
+        return await all(sql, params || []);
+      },
+      async execute(sql, params) {
+        const run = promisify(sqliteDb.run.bind(sqliteDb));
+        await run(sql, params || []);
+      }
+    };
+    
+    console.log('✅ Connected to SQLite database');
+  }
+  
+  await initTables();
+}
+
+// Initialize database tables
+async function initTables() {
+  if (dbType === 'mysql') {
+    await db.execute(`
       CREATE TABLE IF NOT EXISTS accounts (
-        id INTEGER PRIMARY KEY ${this.type === 'mysql' ? 'AUTO_INCREMENT' : 'AUTOINCREMENT'},
-        name VARCHAR(255) NOT NULL UNIQUE,
-        username VARCHAR(255) NOT NULL,
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        username VARCHAR(255) UNIQUE NOT NULL,
         password VARCHAR(255) NOT NULL,
         enabled BOOLEAN DEFAULT TRUE,
-        cron_expression VARCHAR(255) DEFAULT '0 */12 * * *',
-        interval_minutes INTEGER DEFAULT 60,
-        last_keepalive DATETIME,
-        notification_enabled BOOLEAN DEFAULT FALSE,
-        telegram_enabled BOOLEAN DEFAULT FALSE,
-        telegram_bot_token VARCHAR(255),
-        telegram_chat_id VARCHAR(255),
-        wechat_enabled BOOLEAN DEFAULT FALSE,
-        wechat_webhook VARCHAR(255),
-        wxpusher_enabled BOOLEAN DEFAULT FALSE,
-        wxpusher_app_token VARCHAR(255),
-        wxpusher_uid VARCHAR(255),
-        dingtalk_enabled BOOLEAN DEFAULT FALSE,
-        dingtalk_webhook VARCHAR(255),
-        dingtalk_secret VARCHAR(255),
+        cron_expression VARCHAR(100) DEFAULT '0 0 */60 * *',
+        last_login_date DATE DEFAULT NULL,
+        notification_channels JSON DEFAULT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ${onUpdateTimestamp}
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       )
-    `;
-
-    const historyTable = `
-      CREATE TABLE IF NOT EXISTS history (
-        id INTEGER PRIMARY KEY ${this.type === 'mysql' ? 'AUTO_INCREMENT' : 'AUTOINCREMENT'},
-        account_id INTEGER NOT NULL,
+    `);
+    
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS login_history (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        account_id INT NOT NULL,
         success BOOLEAN NOT NULL,
         message TEXT,
+        login_date DATE NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        ${this.type === 'mysql' ? 'FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE' : ''}
+        FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+        INDEX idx_login_date (login_date),
+        INDEX idx_account_date (account_id, login_date)
       )
-    `;
-
-    const settingsTable = `
-      CREATE TABLE IF NOT EXISTS settings (
-        id INTEGER PRIMARY KEY,
-        notification_proxy VARCHAR(255),
-        browser_headless BOOLEAN DEFAULT TRUE,
-        browser_timeout INTEGER DEFAULT 30000,
+    `);
+    
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS notification_settings (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        channel_type VARCHAR(50) NOT NULL,
+        enabled BOOLEAN DEFAULT FALSE,
+        config JSON NOT NULL,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `);
+    
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS system_settings (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        setting_key VARCHAR(100) UNIQUE NOT NULL,
+        setting_value TEXT,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `);
+  } else {
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS accounts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        enabled INTEGER DEFAULT 1,
+        cron_expression TEXT DEFAULT '0 0 */60 * *',
+        last_login_date DATE DEFAULT NULL,
+        notification_channels TEXT DEFAULT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ${onUpdateTimestamp}
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
-    `;
-
-    try {
-      await this.query(accountsTable);
-      await this.query(historyTable);
-      await this.query(settingsTable);
+    `);
+    
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS login_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id INTEGER NOT NULL,
+        success INTEGER NOT NULL,
+        message TEXT,
+        login_date DATE NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+      )
+    `);
+    
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS notification_settings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel_type TEXT NOT NULL,
+        enabled INTEGER DEFAULT 0,
+        config TEXT NOT NULL,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS system_settings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        setting_key TEXT UNIQUE NOT NULL,
+        setting_value TEXT,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+  }
+  
+  // Initialize default notification settings
+  const channels = ['telegram', 'wechat', 'wxpusher', 'dingtalk'];
+  for (const channel of channels) {
+    const existing = await db.query(
+      'SELECT id FROM notification_settings WHERE channel_type = ?',
+      [channel]
+    );
+    
+    if (existing.length === 0) {
+      const defaultConfig = dbType === 'mysql' 
+        ? JSON.stringify({})
+        : '{}';
       
-      // 修复: 根据数据库类型选择正确的插入语法
-      const defaultSettings = this.type === 'mysql' 
-        ? `INSERT IGNORE INTO settings (id) VALUES (1)` 
-        : `INSERT OR IGNORE INTO settings (id) VALUES (1)`;
-      await this.query(defaultSettings);
-      
-      console.log('✅ 数据库表创建成功');
-    } catch (error) {
-      console.error('❌ 创建表失败:', error);
-      throw error;
+      await db.execute(
+        'INSERT INTO notification_settings (channel_type, enabled, config) VALUES (?, ?, ?)',
+        [channel, 0, defaultConfig]
+      );
     }
   }
+  
+  console.log('✅ Database tables initialized');
 }
 
-// ============================================================================
-// 通知服务
-// ============================================================================
+// Express app setup
+const app = express();
+const PORT = parseInt(process.env.PORT || '8181');
+const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
+
+app.use(cors({ credentials: true }));
+app.use(express.json());
+
+// Authentication middleware
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  
+  if (!token) {
+    return res.status(401).json({ message: 'Token is missing!' });
+  }
+  
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(401).json({ message: 'Token is invalid or expired!' });
+    }
+    req.user = user;
+    next();
+  });
+}
+
+// Notification Service
 class NotificationService {
-  static async send(account, title, message) {
-    if (!account.notification_enabled) return;
-
-    const tasks = [];
-
-    // Telegram
-    if (account.telegram_enabled && account.telegram_bot_token && account.telegram_chat_id) {
-      tasks.push(this.sendTelegram(account, title, message));
-    }
-
-    // 企业微信
-    if (account.wechat_enabled && account.wechat_webhook) {
-      tasks.push(this.sendWechat(account, title, message));
-    }
-
-    // WxPusher
-    if (account.wxpusher_enabled && account.wxpusher_app_token && account.wxpusher_uid) {
-      tasks.push(this.sendWxPusher(account, title, message));
-    }
-
-    // 钉钉
-    if (account.dingtalk_enabled && account.dingtalk_webhook) {
-      tasks.push(this.sendDingTalk(account, title, message));
-    }
-
-    try {
-      await Promise.allSettled(tasks);
-    } catch (error) {
-      console.error('通知发送失败:', error);
-    }
-  }
-
-  static async sendTelegram(account, title, message) {
-    const url = `https://api.telegram.org/bot${account.telegram_bot_token}/sendMessage`;
-    await axios.post(url, {
-      chat_id: account.telegram_chat_id,
-      text: `🤖 Netlib 保活通知\n\n${title}\n${message}\n\n时间: ${new Date().toLocaleString()}`
-    }, { timeout: 10000 });
-  }
-
-  static async sendWechat(account, title, message) {
-    await axios.post(account.wechat_webhook, {
-      msgtype: 'text',
-      text: { content: `Netlib 保活通知\n${title}\n${message}` }
-    }, { timeout: 10000 });
-  }
-
-  static async sendWxPusher(account, title, message) {
-    const url = 'https://wxpusher.zjiecode.com/api/send/message';
-    await axios.post(url, {
-      appToken: account.wxpusher_app_token,
-      content: `<h3>${title}</h3><p>${message}</p><p>时间: ${new Date().toLocaleString()}</p>`,
-      contentType: 2,
-      uids: [account.wxpusher_uid]
-    }, { timeout: 10000 });
-  }
-
-  static async sendDingTalk(account, title, message) {
-    let webhook = account.dingtalk_webhook;
+  static async sendNotification(title, content, accountName, channels) {
+    if (!channels || channels.length === 0) return;
     
-    // 如果设置了 secret，需要签名
-    if (account.dingtalk_secret) {
-      const timestamp = Date.now();
-      const stringToSign = `${timestamp}\n${account.dingtalk_secret}`;
-      const sign = crypto.createHmac('sha256', account.dingtalk_secret)
-        .update(stringToSign).digest('base64');
-      const encodedSign = encodeURIComponent(sign);
+    for (const channelType of channels) {
+      const settings = await db.query(
+        'SELECT * FROM notification_settings WHERE channel_type = ? AND enabled = ?',
+        [channelType, dbType === 'mysql' ? true : 1]
+      );
       
-      webhook = `${webhook}&timestamp=${timestamp}&sign=${encodedSign}`;
-    }
-
-    await axios.post(webhook, {
-      msgtype: 'text',
-      text: { content: `Netlib 保活通知\n${title}\n${message}` }
-    }, { timeout: 10000 });
-  }
-}
-
-// ============================================================================
-// 保活服务
-// ============================================================================
-class KeepAliveService {
-  constructor() {
-    this.tasks = new Map();
-    this.running = false;
-  }
-
-  async start() {
-    this.running = true;
-    console.log('🚀 保活服务启动');
-    await this.loadAndScheduleAll();
-    
-    // 每分钟检查一次
-    setInterval(() => this.checkAndSchedule(), 60000);
-  }
-
-  stop() {
-    this.running = false;
-    this.tasks.forEach(task => clearTimeout(task.timeout));
-    this.tasks.clear();
-    console.log('🛑 保活服务停止');
-  }
-
-  async loadAndScheduleAll() {
-    const db = new Database();
-    await db.init();
-    
-    const accounts = await db.query('SELECT * FROM accounts WHERE enabled = 1');
-    
-    for (const account of accounts) {
-      await this.scheduleAccount(account);
-    }
-  }
-
-  async scheduleAccount(account) {
-    if (!this.running) return;
-
-    // 清除现有任务
-    if (this.tasks.has(account.id)) {
-      clearTimeout(this.tasks.get(account.id).timeout);
-    }
-
-    // 计算下次执行时间
-    const now = new Date();
-    let nextRun;
-    
-    if (account.cron_expression) {
-      // 使用 cron 表达式
-      const interval = cron.schedule(account.cron_expression, () => this.execute(account.id));
-      this.tasks.set(account.id, { interval, type: 'cron' });
-      console.log(`⏰ 账号 ${account.name} 使用 cron: ${account.cron_expression}`);
-      return;
-    } else {
-      // 使用间隔时间
-      const intervalMs = (account.interval_minutes || 60) * 60 * 1000;
-      const last = account.last_keepalive ? new Date(account.last_keepalive) : new Date(0);
-      nextRun = new Date(last.getTime() + intervalMs);
+      if (settings.length === 0) continue;
       
-      if (nextRun <= now) {
-        nextRun = new Date(now.getTime() + 5000); // 5秒后执行
+      const config = dbType === 'mysql' 
+        ? settings[0].config 
+        : JSON.parse(settings[0].config);
+      
+      try {
+        switch (channelType) {
+          case 'telegram':
+            await this.sendTelegram(config, title, content);
+            break;
+          case 'wechat':
+            await this.sendWechat(config, title, content);
+            break;
+          case 'wxpusher':
+            await this.sendWxPusher(config, title, content);
+            break;
+          case 'dingtalk':
+            await this.sendDingTalk(config, title, content);
+            break;
+        }
+      } catch (error) {
+        console.error(`Notification error (${channelType}):`, error);
       }
     }
-
-    const timeout = setTimeout(() => {
-      this.execute(account.id);
-    }, nextRun - now);
-
-    this.tasks.set(account.id, { timeout, type: 'interval' });
-    console.log(`⏰ 账号 ${account.name} 下次运行: ${nextRun.toLocaleString()}`);
   }
-
-  async execute(accountId) {
-    const db = new Database();
-    await db.init();
-
-    const account = await db.query('SELECT * FROM accounts WHERE id = ?', [accountId]);
-    if (!account[0]) return;
-
-    const acc = account[0];
-    console.log(`🎯 开始保活: ${acc.name}`);
-
-    let success = false;
-    let message = '';
-
-    try {
-      // 执行登录
-      const result = await this.performLogin(acc);
-      success = result.success;
-      message = result.message;
-
-      console.log(`${success ? '✅' : '❌'} ${acc.name}: ${message}`);
-    } catch (error) {
-      message = error.message;
-      console.error(`❌ ${acc.name} 异常:`, error);
-    }
-
-    // 记录历史
-    await db.run(
-      'INSERT INTO history (account_id, success, message) VALUES (?, ?, ?)',
-      [accountId, success, message]
-    );
-
-    // 更新最后运行时间
-    if (success) {
-      await db.run('UPDATE accounts SET last_keepalive = ? WHERE id = ?', [new Date(), accountId]);
-    }
-
-    // 发送通知
-    if (acc.notification_enabled) {
-      const title = `${acc.name} 保活${success ? '成功' : '失败'}`;
-      await NotificationService.send(acc, title, message);
-    }
-
-    // 重新调度
-    setTimeout(() => this.scheduleAccount(acc), 5000);
+  
+  static async sendTelegram(config, title, content) {
+    const { bot_token, user_id, api_host } = config;
+    if (!bot_token || !user_id) return;
+    
+    const baseUrl = api_host || 'https://api.telegram.org';
+    const url = `${baseUrl}/bot${bot_token}/sendMessage`;
+    
+    await axios.post(url, {
+      chat_id: user_id,
+      text: `📢 ${title}\n\n${content}`,
+      disable_web_page_preview: true
+    }, { timeout: 30000 });
   }
+  
+  static async sendWechat(config, title, content) {
+    const { webhook_key, api_host } = config;
+    if (!webhook_key) return;
+    
+    const baseUrl = api_host || 'https://qyapi.weixin.qq.com';
+    const url = `${baseUrl}/cgi-bin/webhook/send?key=${webhook_key}`;
+    
+    await axios.post(url, {
+      msgtype: 'text',
+      text: { content: `【${title}】\n\n${content}` }
+    }, { timeout: 15000 });
+  }
+  
+  static async sendWxPusher(config, title, content) {
+    const { app_token, uid, api_host } = config;
+    if (!app_token || !uid) return;
+    
+    const baseUrl = api_host || 'https://wxpusher.zjiecode.com';
+    const url = `${baseUrl}/api/send/message`;
+    
+    const htmlContent = `
+      <div style="padding: 10px; color: #2c3e50; background: #ffffff;">
+        <h2 style="color: inherit; margin: 0;">${title}</h2>
+        <div style="margin-top: 10px; padding: 10px; background: #f8f9fa; border-radius: 5px; color: #2c3e50;">
+          <pre style="white-space: pre-wrap; word-wrap: break-word; margin: 0; color: inherit;">${content}</pre>
+        </div>
+        <div style="margin-top: 10px; color: #7f8c8d; font-size: 12px;">
+          发送时间: ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}
+        </div>
+      </div>
+    `;
+    
+    await axios.post(url, {
+      appToken: app_token,
+      content: htmlContent,
+      summary: title.substring(0, 20),
+      contentType: 2,
+      uids: [uid],
+      verifyPayType: 0
+    }, { timeout: 30000 });
+  }
+  
+  static async sendDingTalk(config, title, content) {
+    const { access_token, secret, api_host } = config;
+    if (!access_token || !secret) return;
+    
+    const timestamp = Date.now();
+    const stringToSign = `${timestamp}\n${secret}`;
+    const hmac = crypto.createHmac('sha256', secret);
+    hmac.update(stringToSign);
+    const sign = encodeURIComponent(hmac.digest('base64'));
+    
+    const baseUrl = api_host || 'https://oapi.dingtalk.com';
+    const url = `${baseUrl}/robot/send?access_token=${access_token}&timestamp=${timestamp}&sign=${sign}`;
+    
+    await axios.post(url, {
+      msgtype: 'text',
+      text: { content: `【${title}】\n${content}` },
+      at: { isAtAll: false }
+    }, { timeout: 30000 });
+  }
+}
 
-  async performLogin(account) {
+// Netlib Login Service
+class NetlibLoginService {
+  constructor() {
+    this.loginUrl = 'https://www.netlib.re/';
+    this.userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+  }
+  
+  async performLogin(username, password, accountName) {
+    console.log(`🚀 Starting login for account: ${accountName}`);
+    
     const browser = await chromium.launch({
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox']
     });
-
+    
+    let page;
+    let success = false;
+    let message = '';
+    
     try {
-      const page = await browser.newPage();
-      await page.setDefaultTimeout(CONFIG.keepalive.timeout);
-
-      console.log(`📱 ${account.name} - 访问网站...`);
-      await page.goto('https://www.netlib.re/', { waitUntil: 'networkidle' });
-      await page.waitForTimeout(2000);
-
-      console.log(`🔑 ${account.name} - 点击登录...`);
-      await page.click('text=Login');
-      await page.waitForTimeout(1000);
-
-      console.log(`📝 ${account.name} - 填写用户名...`);
-      await page.fill('input[name="username"], input[type="text"]', account.username);
-      await page.waitForTimeout(500);
-
-      console.log(`🔒 ${account.name} - 填写密码...`);
-      await page.fill('input[name="password"], input[type="password"]', account.password);
-      await page.waitForTimeout(500);
-
-      console.log(`📤 ${account.name} - 提交登录...`);
-      await page.click('button:has-text("Validate"), input[type="submit"]');
-      await page.waitForLoadState('networkidle');
-      await page.waitForTimeout(3000);
-
-      // 检查登录结果
-      const content = await page.content();
+      page = await browser.newPage();
+      page.setDefaultTimeout(30000);
       
-      if (content.includes('exclusive owner') || content.includes(account.username)) {
-        return {
-          success: true,
-          message: '登录成功'
-        };
+      console.log(`📱 ${accountName} - Accessing website...`);
+      await page.goto(this.loginUrl, { waitUntil: 'networkidle' });
+      await page.waitForTimeout(3000);
+      
+      console.log(`🔑 ${accountName} - Clicking login button...`);
+      await page.click('text=Login', { timeout: 5000 });
+      await page.waitForTimeout(2000);
+      
+      console.log(`📝 ${accountName} - Filling username...`);
+      await page.fill('input[name="username"], input[type="text"]', username);
+      await page.waitForTimeout(1000);
+      
+      console.log(`🔒 ${accountName} - Filling password...`);
+      await page.fill('input[name="password"], input[type="password"]', password);
+      await page.waitForTimeout(1000);
+      
+      console.log(`📤 ${accountName} - Submitting login...`);
+      await page.click('button:has-text("Validate"), input[type="submit"]');
+      
+      await page.waitForLoadState('networkidle');
+      await page.waitForTimeout(5000);
+      
+      const pageContent = await page.content();
+      
+      if (pageContent.includes('exclusive owner') || pageContent.includes(username)) {
+        console.log(`✅ ${accountName} - Login successful`);
+        success = true;
+        message = 'Login successful';
       } else {
-        return {
-          success: false,
-          message: '登录失败'
-        };
+        console.log(`❌ ${accountName} - Login failed`);
+        message = 'Login failed - invalid credentials or page structure changed';
       }
     } catch (error) {
-      return {
-        success: false,
-        message: `执行异常: ${error.message}`
-      };
+      console.log(`❌ ${accountName} - Login error: ${error.message}`);
+      message = `Login error: ${error.message}`;
     } finally {
+      if (page) await page.close();
       await browser.close();
     }
-  }
-
-  async checkAndSchedule() {
-    const db = new Database();
-    await db.init();
     
-    const accounts = await db.query('SELECT * FROM accounts WHERE enabled = 1');
+    return { success, message };
+  }
+}
+
+// Scheduler
+class LoginScheduler {
+  constructor() {
+    this.jobs = new Map();
+    this.loginService = new NetlibLoginService();
+  }
+  
+  async start() {
+    console.log('🔄 Starting scheduler...');
+    
+    // Load all enabled accounts
+    const accounts = await db.query(
+      'SELECT * FROM accounts WHERE enabled = ?',
+      [dbType === 'mysql' ? true : 1]
+    );
     
     for (const account of accounts) {
-      const task = this.tasks.get(account.id);
-      if (!task) {
-        await this.scheduleAccount(account);
-      }
+      this.scheduleAccount(account);
+    }
+    
+    console.log(`✅ Scheduler started with ${accounts.length} accounts`);
+  }
+  
+  scheduleAccount(account) {
+    // Remove existing job if any
+    if (this.jobs.has(account.id)) {
+      this.jobs.get(account.id).stop();
+    }
+    
+    // Schedule new job
+    const cronExpression = account.cron_expression || '0 0 */60 * *';
+    
+    try {
+      const job = cron.schedule(cronExpression, async () => {
+        await this.executeLogin(account.id);
+      });
+      
+      this.jobs.set(account.id, job);
+      console.log(`📅 Scheduled account ${account.username} with cron: ${cronExpression}`);
+    } catch (error) {
+      console.error(`Error scheduling account ${account.username}:`, error);
     }
   }
-
-  async manualExecute(accountId) {
-    return this.execute(accountId);
-  }
-}
-
-// ============================================================================
-// Express 应用
-// ============================================================================
-const app = express();
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-// CORS
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Authorization, Content-Type');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  if (req.method === 'OPTIONS') {
-    res.sendStatus(200);
-  } else {
-    next();
-  }
-});
-
-// JWT 验证中间件
-function authenticate(req, res, next) {
-  const token = req.headers.authorization?.split(' ')[1];
   
-  if (!token) {
-    return res.status(401).json({ error: '未提供token' });
+  async executeLogin(accountId) {
+    try {
+      const accounts = await db.query('SELECT * FROM accounts WHERE id = ?', [accountId]);
+      if (accounts.length === 0 || !accounts[0].enabled) return;
+      
+      const account = accounts[0];
+      const today = new Date().toISOString().split('T')[0];
+      
+      // Check if already logged in today
+      const existing = await db.query(
+        'SELECT id FROM login_history WHERE account_id = ? AND login_date = ?',
+        [accountId, today]
+      );
+      
+      if (existing.length > 0) {
+        console.log(`Account ${account.username} already logged in today`);
+        return;
+      }
+      
+      // Perform login
+      const result = await this.loginService.performLogin(
+        account.username,
+        account.password,
+        account.username
+      );
+      
+      // Record history
+      await db.execute(
+        'INSERT INTO login_history (account_id, success, message, login_date) VALUES (?, ?, ?, ?)',
+        [accountId, result.success ? 1 : 0, result.message, today]
+      );
+      
+      // Update last login date if successful
+      if (result.success) {
+        await db.execute(
+          'UPDATE accounts SET last_login_date = ? WHERE id = ?',
+          [today, accountId]
+        );
+      }
+      
+      // Send notification
+      const channels = dbType === 'mysql'
+        ? account.notification_channels
+        : (account.notification_channels ? JSON.parse(account.notification_channels) : null);
+      
+      if (channels && channels.length > 0) {
+        const title = `Netlib 保活结果 - ${account.username}`;
+        const status = result.success ? '✅ 成功' : '❌ 失败';
+        const content = `状态: ${status}\n消息: ${result.message}`;
+        
+        await NotificationService.sendNotification(title, content, account.username, channels);
+      }
+      
+      console.log(`Login for ${account.username}: ${result.success ? 'Success' : 'Failed'}`);
+    } catch (error) {
+      console.error(`Error executing login for account ${accountId}:`, error);
+    }
   }
-
-  try {
-    const decoded = jwt.verify(token, CONFIG.jwtSecret);
-    req.user = decoded.username;
-    next();
-  } catch (error) {
-    return res.status(401).json({ error: '无效的token' });
+  
+  removeAccount(accountId) {
+    if (this.jobs.has(accountId)) {
+      this.jobs.get(accountId).stop();
+      this.jobs.delete(accountId);
+    }
   }
 }
 
-// ============================================================================
-// API 路由
-// ============================================================================
+const scheduler = new LoginScheduler();
 
-// 登录
-app.post('/api/login', async (req, res) => {
+// API Routes
+
+// Login
+app.post('/api/login', (req, res) => {
   const { username, password } = req.body;
-
-  if (username === CONFIG.adminUsername && password === CONFIG.adminPassword) {
-    const token = jwt.sign({ username }, CONFIG.jwtSecret, { expiresIn: '7d' });
-    res.json({ token });
-  } else {
-    res.status(401).json({ error: '用户名或密码错误' });
+  
+  if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
+    const token = jwt.sign({ user: username }, JWT_SECRET, { expiresIn: '7d' });
+    return res.json({ token, message: 'Login successful' });
   }
+  
+  res.status(401).json({ message: 'Invalid credentials' });
 });
 
-// 仪表板数据
-app.get('/api/dashboard', authenticate, async (req, res) => {
-  const db = new Database();
-  await db.init();
+// Verify token
+app.get('/api/verify', authenticateToken, (req, res) => {
+  res.json({ valid: true });
+});
 
+// Dashboard statistics
+app.get('/api/dashboard', authenticateToken, async (req, res) => {
   try {
     const totalAccounts = await db.query('SELECT COUNT(*) as count FROM accounts');
-    const activeAccounts = await db.query('SELECT COUNT(*) as count FROM accounts WHERE enabled = 1');
-    const totalHistory = await db.query('SELECT COUNT(*) as count FROM history');
-    const successHistory = await db.query('SELECT COUNT(*) as count FROM history WHERE success = 1');
+    const enabledAccounts = await db.query(
+      'SELECT COUNT(*) as count FROM accounts WHERE enabled = ?',
+      [dbType === 'mysql' ? true : 1]
+    );
     
-    // 修复: 根据数据库类型使用不同的日期函数
-    const dateCondition = db.type === 'mysql' 
-      ? `DATE(h.created_at) = CURDATE()` 
-      : `DATE(h.created_at) = DATE('now')`;
-
-    const todayHistorySQL = `
-      SELECT h.*, a.name as account_name 
-      FROM history h 
-      JOIN accounts a ON h.account_id = a.id 
-      WHERE ${dateCondition}
-      ORDER BY h.created_at DESC 
-      LIMIT 20
-    `;
+    const today = new Date().toISOString().split('T')[0];
+    const todayLogins = await db.query(
+      `SELECT a.username, lh.success, lh.message, lh.created_at
+       FROM login_history lh
+       JOIN accounts a ON lh.account_id = a.id
+       WHERE DATE(lh.login_date) = DATE(?)
+       ORDER BY lh.created_at DESC
+       LIMIT 20`,
+      [today]
+    );
     
-    const todayHistory = await db.query(todayHistorySQL);
-
-    const total = totalAccounts[0].count;
-    const active = activeAccounts[0].count;
-    const totalHis = totalHistory[0].count;
-    const successHis = successHistory[0].count;
-    const rate = totalHis > 0 ? ((successHis / totalHis) * 100).toFixed(2) : 0;
-
+    const totalLogins = await db.query('SELECT COUNT(*) as count FROM login_history');
+    const successfulLogins = await db.query(
+      'SELECT COUNT(*) as count FROM login_history WHERE success = ?',
+      [dbType === 'mysql' ? true : 1]
+    );
+    
+    const totalCount = totalLogins[0].count;
+    const successCount = successfulLogins[0].count;
+    const successRate = totalCount > 0 ? ((successCount / totalCount) * 100).toFixed(2) : 0;
+    
     res.json({
-      totalAccounts: total,
-      activeAccounts: active,
-      successRate: rate,
-      todayHistory
+      total_accounts: totalAccounts[0].count,
+      enabled_accounts: enabledAccounts[0].count,
+      today_logins: todayLogins,
+      total_logins: totalCount,
+      successful_logins: successCount,
+      success_rate: successRate
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error('Dashboard error:', error);
+    res.status(500).json({ error: 'Failed to load dashboard data' });
   }
 });
 
-// 获取账号列表
-app.get('/api/accounts', authenticate, async (req, res) => {
-  const db = new Database();
-  await db.init();
-
+// Get all accounts
+app.get('/api/accounts', authenticateToken, async (req, res) => {
   try {
-    const accounts = await db.query('SELECT * FROM accounts');
-    res.json(accounts);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 添加账号
-app.post('/api/accounts', authenticate, async (req, res) => {
-  const db = new Database();
-  await db.init();
-
-  try {
-    const { name, username, password, cron_expression, interval_minutes, notification } = req.body;
-    
-    const result = await db.run(
-      `INSERT INTO accounts (name, username, password, cron_expression, interval_minutes, 
-        notification_enabled, telegram_enabled, telegram_bot_token, telegram_chat_id,
-        wechat_enabled, wechat_webhook, wxpusher_enabled, wxpusher_app_token, wxpusher_uid,
-        dingtalk_enabled, dingtalk_webhook, dingtalk_secret) 
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        name, username, password, cron_expression, interval_minutes,
-        notification?.enabled, notification?.telegram?.enabled, notification?.telegram?.botToken, notification?.telegram?.chatId,
-        notification?.wechat?.enabled, notification?.wechat?.webhook,
-        notification?.wxpusher?.enabled, notification?.wxpusher?.appToken, notification?.wxpusher?.uid,
-        notification?.dingtalk?.enabled, notification?.dingtalk?.webhook, notification?.dingtalk?.secret
-      ]
+    const accounts = await db.query(
+      'SELECT id, username, enabled, cron_expression, notification_channels, last_login_date, created_at FROM accounts'
     );
-
-    const accountId = result.insertId || result.lastID;
     
-    // 立即调度
-    const service = new KeepAliveService();
-    await service.scheduleAccount({ id: accountId, ...req.body });
-
-    res.json({ id: accountId, message: '账号添加成功' });
+    const result = accounts.map(acc => ({
+      ...acc,
+      notification_channels: dbType === 'sqlite' && acc.notification_channels
+        ? JSON.parse(acc.notification_channels)
+        : acc.notification_channels
+    }));
+    
+    res.json(result);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error('Get accounts error:', error);
+    res.status(500).json({ error: 'Failed to load accounts' });
   }
 });
 
-// 更新账号
-app.put('/api/accounts/:id', authenticate, async (req, res) => {
-  const db = new Database();
-  await db.init();
+// Add account
+app.post('/api/accounts', authenticateToken, async (req, res) => {
+  try {
+    const { username, password, cron_expression, notification_channels } = req.body;
+    
+    if (!username || !password) {
+      return res.status(400).json({ message: 'Username and password are required' });
+    }
+    
+    const channels = dbType === 'mysql'
+      ? notification_channels
+      : JSON.stringify(notification_channels || []);
+    
+    await db.execute(
+      'INSERT INTO accounts (username, password, cron_expression, notification_channels) VALUES (?, ?, ?, ?)',
+      [username, password, cron_expression || '0 0 */60 * *', channels]
+    );
+    
+    // Get the new account and schedule it
+    const newAccounts = await db.query('SELECT * FROM accounts WHERE username = ?', [username]);
+    if (newAccounts.length > 0) {
+      scheduler.scheduleAccount(newAccounts[0]);
+    }
+    
+    res.json({ message: 'Account added successfully' });
+  } catch (error) {
+    console.error('Add account error:', error);
+    res.status(400).json({ message: error.message });
+  }
+});
 
+// Update account
+app.put('/api/accounts/:id', authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, username, password, enabled, cron_expression, interval_minutes, notification } = req.body;
-
-    await db.run(
-      `UPDATE accounts SET 
-        name = ?, username = ?, password = ?, enabled = ?, 
-        cron_expression = ?, interval_minutes = ?,
-        notification_enabled = ?, telegram_enabled = ?, telegram_bot_token = ?, telegram_chat_id = ?,
-        wechat_enabled = ?, wechat_webhook = ?, wxpusher_enabled = ?, wxpusher_app_token = ?, wxpusher_uid = ?,
-        dingtalk_enabled = ?, dingtalk_webhook = ?, dingtalk_secret = ?
-      WHERE id = ?`,
-      [
-        name, username, password, enabled, cron_expression, interval_minutes,
-        notification?.enabled, notification?.telegram?.enabled, notification?.telegram?.botToken, notification?.telegram?.chatId,
-        notification?.wechat?.enabled, notification?.wechat?.webhook,
-        notification?.wxpusher?.enabled, notification?.wxpusher?.appToken, notification?.wxpusher?.uid,
-        notification?.dingtalk?.enabled, notification?.dingtalk?.webhook, notification?.dingtalk?.secret,
-        id
-      ]
-    );
-
-    res.json({ message: '账号更新成功' });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 删除账号
-app.delete('/api/accounts/:id', authenticate, async (req, res) => {
-  const db = new Database();
-  await db.init();
-
-  try {
-    const { id } = request.params;
-    await db.run('DELETE FROM accounts WHERE id = ?', [id]);
-    res.json({ message: '账号删除成功' });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 手动执行保活
-app.post('/api/accounts/:id/keepalive', authenticate, async (req, res) => {
-  const service = new KeepAliveService();
-  try {
-    await service.manualExecute(req.params.id);
-    res.json({ message: '保活任务已触发' });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 获取系统设置
-app.get('/api/settings', authenticate, async (req, res) => {
-  const db = new Database();
-  await db.init();
-
-  try {
-    const settings = await db.query('SELECT * FROM settings WHERE id = 1');
-    res.json(settings[0] || {});
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 更新系统设置
-app.put('/api/settings', authenticate, async (req, res) => {
-  const db = new Database();
-  await db.init();
-
-  try {
-    const { notification_proxy, browser_headless, browser_timeout } = req.body;
+    const { enabled, password, cron_expression, notification_channels } = req.body;
     
-    await db.run(
-      `UPDATE settings SET 
-        notification_proxy = ?, browser_headless = ?, browser_timeout = ? 
-      WHERE id = 1`,
-      [notification_proxy, browser_headless, browser_timeout]
-    );
-
-    res.json({ message: '设置更新成功' });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// 发送测试通知
-app.post('/api/test-notification', authenticate, async (req, res) => {
-  const db = new Database();
-  await db.init();
-
-  try {
-    // 使用第一个账号的通知配置
-    const accounts = await db.query('SELECT * FROM accounts WHERE enabled = 1 LIMIT 1');
-    if (!accounts[0]) {
-      return res.status(400).json({ error: '没有可用的账号配置' });
-    }
-
-    await NotificationService.send(accounts[0], '测试通知', '这是一条测试消息');
-    res.json({ message: '测试通知已发送' });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ============================================================================
-// 前端界面
-// ============================================================================
-const HTML_TEMPLATE = `
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Netlib 保活控制面板</title>
-  <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
-  <style>
-    :root {
-      --primary: #667eea;
-      --success: #48bb78;
-      --danger: #f56565;
-      --warning: #ed8936;
-      --bg: #f7fafc;
-      --card: #ffffff;
-      --text: #2d3748;
-      --border: #e2e8f0;
+    const updates = [];
+    const params = [];
+    
+    if (typeof enabled !== 'undefined') {
+      updates.push('enabled = ?');
+      params.push(dbType === 'mysql' ? enabled : (enabled ? 1 : 0));
     }
     
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); }
-    
-    .login-container { min-height: 100vh; display: flex; align-items: center; justify-content: center; background: linear-gradient(135deg, var(--primary), #764ba2); }
-    .login-box { background: white; padding: 40px; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.1); width: 90%; max-width: 400px; }
-    .login-box h2 { margin-bottom: 24px; text-align: center; }
-    .form-group { margin-bottom: 16px; }
-    .form-group label { display: block; margin-bottom: 6px; font-size: 14px; }
-    .form-group input { width: 100%; padding: 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 14px; }
-    .form-group select { width: 100%; padding: 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 14px; }
-    .btn { padding: 12px 24px; border: none; border-radius: 6px; font-size: 14px; cursor: pointer; transition: all 0.2s; }
-    .btn-primary { background: var(--primary); color: white; }
-    .btn:hover { opacity: 0.9; }
-    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-    
-    .dashboard { display: none; padding: 20px; }
-    .header { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; }
-    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
-    .stat-card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); }
-    .stat-card h3 { font-size: 14px; color: #718096; margin-bottom: 8px; }
-    .stat-card .value { font-size: 28px; font-weight: bold; color: var(--primary); }
-    
-    .section { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
-    .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
-    .table { width: 100%; border-collapse: collapse; }
-    .table th, .table td { padding: 12px; text-align: left; border-bottom: 1px solid var(--border); }
-    .table th { font-weight: 600; font-size: 12px; text-transform: uppercase; color: #718096; }
-    
-    .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); align-items: center; justify-content: center; }
-    .modal.show { display: flex; }
-    .modal-content { background: white; padding: 24px; border-radius: 8px; width: 90%; max-width: 600px; max-height: 90vh; overflow-y: auto; }
-    
-    .switch { position: relative; display: inline-block; width: 48px; height: 24px; }
-    .switch input { opacity: 0; width: 0; height: 0; }
-    .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #ccc; transition: .4s; border-radius: 24px; }
-    .slider:before { position: absolute; content: ""; height: 16px; width: 16px; left: 4px; bottom: 4px; background-color: white; transition: .4s; border-radius: 50%; }
-    input:checked + .slider { background-color: var(--primary); }
-    input:checked + .slider:before { transform: translateX(24px); }
-    
-    .notification-channel { border: 1px solid var(--border); padding: 16px; border-radius: 8px; margin-bottom: 12px; }
-    .channel-header { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
-    
-    .toast { position: fixed; bottom: 20px; right: 20px; background: white; padding: 16px 20px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); display: none; align-items: center; gap: 12px; }
-    .toast.show { display: flex; }
-    .toast.success { border-left: 4px solid var(--success); }
-    .toast.error { border-left: 4px solid var(--danger); }
-  </style>
-</head>
-<body>
-  <div class="login-container" id="loginContainer">
-    <div class="login-box">
-      <h2>🔐 管理员登录</h2>
-      <form id="loginForm">
-        <div class="form-group">
-          <label>用户名</label>
-          <input type="text" id="username" required>
-        </div>
-        <div class="form-group">
-          <label>密码</label>
-          <input type="password" id="password" required>
-        </div>
-        <button type="submit" class="btn btn-primary" style="width: 100%;">登录</button>
-      </form>
-    </div>
-  </div>
-
-  <div class="dashboard" id="dashboard">
-    <div class="header">
-      <h1>Netlib 保活控制面板</h1>
-      <button class="btn btn-danger" onclick="logout()">退出</button>
-    </div>
-
-    <div class="stats-grid">
-      <div class="stat-card">
-        <h3>账号总数</h3>
-        <div class="value" id="totalAccounts">0</div>
-      </div>
-      <div class="stat-card">
-        <h3>活跃账号</h3>
-        <div class="value" id="activeAccounts">0</div>
-      </div>
-      <div class="stat-card">
-        <h3>成功率</h3>
-        <div class="value" id="successRate">0%</div>
-      </div>
-      <div class="stat-card">
-        <h3>今日执行</h3>
-        <div class="value" id="todayCount">0</div>
-      </div>
-    </div>
-
-    <div class="section">
-      <div class="section-header">
-        <h2>账号管理</h2>
-        <button class="btn btn-primary" onclick="showAddModal()">添加账号</button>
-      </div>
-      <table class="table" id="accountsTable">
-        <thead>
-          <tr>
-            <th>名称</th>
-            <th>用户名</th>
-            <th>状态</th>
-            <th>执行方式</th>
-            <th>上次运行</th>
-            <th>操作</th>
-          </tr>
-        </thead>
-        <tbody id="accountsBody">\${/* 数据将通过JS动态加载 */}</tbody>
-      </table>
-    </div>
-
-    <div class="section">
-      <h2>今日执行记录</h2>
-      <table class="table" id="historyTable">
-        <thead>
-          <tr>
-            <th>账号</th>
-            <th>状态</th>
-            <th>消息</th>
-            <th>时间</th>
-          </tr>
-        </thead>
-        <tbody id="historyBody">\${/* 数据将通过JS动态加载 */}</tbody>
-      </table>
-    </div>
-  </div>
-
-  <!-- 添加账号模态框 -->
-  <div class="modal" id="addModal">
-    <div class="modal-content">
-      <h2>添加账号</h2>
-      <form id="addForm">
-        <div class="form-group">
-          <label>账号名称</label>
-          <input type="text" id="addName" required>
-        </div>
-        <div class="form-group">
-          <label>用户名</label>
-          <input type="text" id="addUsername" required>
-        </div>
-        <div class="form-group">
-          <label>密码</label>
-          <input type="password" id="addPassword" required>
-        </div>
-        <div class="form-group">
-          <label>执行方式</label>
-          <select id="addScheduleType">
-            <option value="interval">时间间隔</option>
-            <option value="cron">Cron 表达式</option>
-          </select>
-        </div>
-        <div class="form-group" id="intervalGroup">
-          <label>间隔分钟数</label>
-          <input type="number" id="addInterval" value="60" min="30">
-        </div>
-        <div class="form-group" id="cronGroup" style="display:none;">
-          <label>Cron 表达式</label>
-          <input type="text" id="addCron" value="0 */12 * * *">
-        </div>
-        
-        <!-- 通知设置 -->
-        <h3 style="margin: 20px 0 10px;">通知设置</h3>
-        <div class="notification-channel">
-          <div class="channel-header">
-            <label class="switch">
-              <input type="checkbox" id="enableNotify" onchange="toggleNotify(this)">
-              <span class="slider"></span>
-            </label>
-            <strong>启用通知</strong>
-          </div>
-          
-          <div id="notifyChannels" style="display:none;">
-            <!-- Telegram -->
-            <div class="notification-channel">
-              <div class="channel-header">
-                <label class="switch">
-                  <input type="checkbox" id="enableTelegram">
-                  <span class="slider"></span>
-                </label>
-                <strong>Telegram</strong>
-              </div>
-              <div class="form-group">
-                <label>Bot Token</label>
-                <input type="text" id="tgToken">
-              </div>
-              <div class="form-group">
-                <label>Chat ID</label>
-                <input type="text" id="tgChat">
-              </div>
-            </div>
-
-            <!-- 企业微信 -->
-            <div class="notification-channel">
-              <div class="channel-header">
-                <label class="switch">
-                  <input type="checkbox" id="enableWechat">
-                  <span class="slider"></span>
-                </label>
-                <strong>企业微信</strong>
-              </div>
-              <div class="form-group">
-                <label>Webhook</label>
-                <input type="text" id="wechatWebhook">
-              </div>
-            </div>
-
-            <!-- WxPusher -->
-            <div class="notification-channel">
-              <div class="channel-header">
-                <label class="switch">
-                  <input type="checkbox" id="enableWxPusher">
-                  <span class="slider"></span>
-                </label>
-                <strong>WxPusher</strong>
-              </div>
-              <div class="form-group">
-                <label>App Token</label>
-                <input type="text" id="wxToken">
-              </div>
-              <div class="form-group">
-                <label>UID</label>
-                <input type="text" id="wxUid">
-              </div>
-            </div>
-
-            <!-- 钉钉 -->
-            <div class="notification-channel">
-              <div class="channel-header">
-                <label class="switch">
-                  <input type="checkbox" id="enableDingTalk">
-                  <span class="slider"></span>
-                </label>
-                <strong>钉钉</strong>
-              </div>
-              <div class="form-group">
-                <label>Webhook</label>
-                <input type="text" id="dingWebhook">
-              </div>
-              <div class="form-group">
-                <label>Secret (可选)</label>
-                <input type="text" id="dingSecret">
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div style="display:flex; gap: 10px; margin-top: 20px;">
-          <button type="submit" class="btn btn-primary" style="flex:1;">保存</button>
-          <button type="button" class="btn" onclick="closeModal('addModal')">取消</button>
-        </div>
-      </form>
-    </div>
-  </div>
-
-  <div class="toast" id="toast"></div>
-
-  <script>
-    // 确保脚本在 DOM 加载完成后执行
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', initApp);
-    } else {
-      initApp();
+    if (password) {
+      updates.push('password = ?');
+      params.push(password);
     }
-
-    function initApp() {
-      console.log('初始化应用...');
-      
-      let token = localStorage.getItem('token');
-      console.log('Token 从 localStorage 读取:', token ? '存在' : '不存在');
-
-      const API = axios.create({ 
-        baseURL: '/api',
-        timeout: 10000
-      });
-      
-      API.interceptors.request.use(config => {
-        if (token) {
-          config.headers.Authorization = 'Bearer ' + token;
-          console.log('添加 Authorization header');
-        }
-        return config;
-      });
-
-      API.interceptors.response.use(
-        response => response,
-        error => {
-          console.error('API 请求错误:', error);
-          if (error.response?.status === 401) {
-            logout();
-          }
-          return Promise.reject(error);
-        }
+    
+    if (cron_expression) {
+      updates.push('cron_expression = ?');
+      params.push(cron_expression);
+    }
+    
+    if (notification_channels) {
+      updates.push('notification_channels = ?');
+      params.push(dbType === 'mysql' ? notification_channels : JSON.stringify(notification_channels));
+    }
+    
+    if (updates.length > 0) {
+      params.push(id);
+      await db.execute(
+        `UPDATE accounts SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        params
       );
-
-      // 登录表单提交
-      const loginForm = document.getElementById('loginForm');
-      if (loginForm) {
-        loginForm.addEventListener('submit', async (e) => {
-          e.preventDefault();
-          console.log('登录表单提交');
-          
-          const username = document.getElementById('username').value;
-          const password = document.getElementById('password').value;
-          
-          if (!username || !password) {
-            alert('请输入用户名和密码');
-            return;
-          }
-
-          try {
-            console.log('发送登录请求...');
-            const res = await API.post('/login', { username, password });
-            console.log('登录响应:', res.data);
-            
-            if (res.data.token) {
-              token = res.data.token;
-              localStorage.setItem('token', token);
-              console.log('Token 已保存到 localStorage');
-              
-              // 切换界面
-              document.getElementById('loginContainer').style.display = 'none';
-              document.getElementById('dashboard').style.display = 'block';
-              console.log('界面已切换');
-              
-              // 加载数据
-              await loadDashboard();
-              await loadAccounts();
-              console.log('数据加载完成');
-            } else {
-              throw new Error('未返回 token');
-            }
-          } catch (err) {
-            console.error('登录失败:', err);
-            const errorMsg = err.response?.data?.error || err.message || '未知错误';
-            alert('登录失败: ' + errorMsg);
-          }
-        });
-      }
-
-      // 其他功能函数...
-      window.logout = function() {
-        console.log('执行登出');
-        token = null;
-        localStorage.removeItem('token');
-        location.reload();
-      };
-
-      window.loadDashboard = async function() {
-        try {
-          console.log('加载仪表板数据...');
-          const res = await API.get('/dashboard');
-          const data = res.data;
-          console.log('仪表板数据:', data);
-          
-          document.getElementById('totalAccounts').textContent = data.totalAccounts;
-          document.getElementById('activeAccounts').textContent = data.activeAccounts;
-          document.getElementById('successRate').textContent = data.successRate + '%';
-          document.getElementById('todayCount').textContent = data.todayHistory?.length || 0;
-          
-          // 填充历史记录
-          const tbody = document.getElementById('historyBody');
-          tbody.innerHTML = data.todayHistory?.map(h => \`
-            <tr>
-              <td>\${h.account_name}</td>
-              <td><span style="color:\${h.success?'var(--success)':'var(--danger)'}">\${h.success?'成功':'失败'}</span></td>
-              <td>\${h.message}</td>
-              <td>\${new Date(h.created_at).toLocaleString()}</td>
-            </tr>
-          \`).join('') || '<tr><td colspan="4">暂无记录</td></tr>';
-        } catch (err) {
-          console.error('加载仪表板失败:', err);
-          showToast('加载仪表板失败: ' + (err.message || '未知错误'), 'error');
+      
+      // Reschedule if enabled or cron changed
+      const accounts = await db.query('SELECT * FROM accounts WHERE id = ?', [id]);
+      if (accounts.length > 0) {
+        if (accounts[0].enabled) {
+          scheduler.scheduleAccount(accounts[0]);
+        } else {
+          scheduler.removeAccount(parseInt(id));
         }
-      };
-
-      window.loadAccounts = async function() {
-        try {
-          console.log('加载账号列表...');
-          const res = await API.get('/accounts');
-          console.log('账号数据:', res.data);
-          
-          const tbody = document.getElementById('accountsBody');
-          tbody.innerHTML = res.data.map(a => \`
-            <tr>
-              <td>\${a.name}</td>
-              <td>\${a.username}</td>
-              <td><span style="color:\${a.enabled?'var(--success)':'var(--danger)'}">\${a.enabled?'启用':'禁用'}</span></td>
-              <td>\${a.cron_expression || '每' + (a.interval_minutes || 60) + '分钟'}</td>
-              <td>\${a.last_keepalive ? new Date(a.last_keepalive).toLocaleString() : '从未运行'}</td>
-              <td>
-                <button class="btn btn-primary btn-sm" onclick="manualKeepalive(\${a.id})">立即执行</button>
-                <button class="btn btn-warning btn-sm" onclick="editAccount(\${a.id})">编辑</button>
-                <button class="btn btn-danger btn-sm" onclick="deleteAccount(\${a.id})">删除</button>
-              </td>
-            </tr>
-          \`).join('');
-        } catch (err) {
-          console.error('加载账号失败:', err);
-          showToast('加载账号失败: ' + (err.message || '未知错误'), 'error');
-        }
-      };
-
-      window.showAddModal = function() {
-        document.getElementById('addModal').classList.add('show');
-      };
-
-      window.closeModal = function(id) {
-        document.getElementById(id).classList.remove('show');
-      };
-
-      // 切换通知设置显示
-      window.toggleNotify = function(checkbox) {
-        document.getElementById('notifyChannels').style.display = checkbox.checked ? 'block' : 'none';
-      };
-
-      // 切换计划方式
-      const scheduleTypeSelect = document.getElementById('addScheduleType');
-      if (scheduleTypeSelect) {
-        scheduleTypeSelect.addEventListener('change', (e) => {
-          document.getElementById('intervalGroup').style.display = e.target.value === 'interval' ? 'block' : 'none';
-          document.getElementById('cronGroup').style.display = e.target.value === 'cron' ? 'block' : 'none';
-        });
-      }
-
-      // 添加账号
-      const addForm = document.getElementById('addForm');
-      if (addForm) {
-        addForm.addEventListener('submit', async (e) => {
-          e.preventDefault();
-          console.log('添加账号表单提交');
-          
-          try {
-            const notification = {
-              enabled: document.getElementById('enableNotify').checked,
-              telegram: {
-                enabled: document.getElementById('enableTelegram').checked,
-                botToken: document.getElementById('tgToken').value,
-                chatId: document.getElementById('tgChat').value
-              },
-              wechat: {
-                enabled: document.getElementById('enableWechat').checked,
-                webhook: document.getElementById('wechatWebhook').value
-              },
-              wxpusher: {
-                enabled: document.getElementById('enableWxPusher').checked,
-                appToken: document.getElementById('wxToken').value,
-                uid: document.getElementById('wxUid').value
-              },
-              dingtalk: {
-                enabled: document.getElementById('enableDingTalk').checked,
-                webhook: document.getElementById('dingWebhook').value,
-                secret: document.getElementById('dingSecret').value
-              }
-            };
-
-            const data = {
-              name: document.getElementById('addName').value,
-              username: document.getElementById('addUsername').value,
-              password: document.getElementById('addPassword').value,
-              cron_expression: document.getElementById('addScheduleType').value === 'cron' ? document.getElementById('addCron').value : null,
-              interval_minutes: document.getElementById('addScheduleType').value === 'interval' ? parseInt(document.getElementById('addInterval').value) : null,
-              notification
-            };
-
-            await API.post('/accounts', data);
-            showToast('账号添加成功', 'success');
-            closeModal('addModal');
-            loadAccounts();
-          } catch (err) {
-            console.error('添加账号失败:', err);
-            showToast('添加失败: ' + (err.response?.data?.error || err.message || '未知错误'), 'error');
-          }
-        });
-      }
-
-      window.manualKeepalive = async function(id) {
-        if (confirm('确定立即执行保活吗？')) {
-          try {
-            await API.post('/accounts/' + id + '/keepalive');
-            showToast('保活任务已触发', 'success');
-          } catch (err) {
-            console.error('执行保活失败:', err);
-            showToast('执行失败: ' + (err.response?.data?.error || err.message || '未知错误'), 'error');
-          }
-        }
-      };
-
-      window.deleteAccount = async function(id) {
-        if (confirm('确定删除该账号吗？')) {
-          try {
-            await API.delete('/accounts/' + id);
-            showToast('账号删除成功', 'success');
-            loadAccounts();
-          } catch (err) {
-            console.error('删除账号失败:', err);
-            showToast('删除失败: ' + (err.response?.data?.error || err.message || '未知错误'), 'error');
-          }
-        }
-      };
-
-      function showToast(message, type = 'info') {
-        const toast = document.getElementById('toast');
-        if (toast) {
-          toast.textContent = message;
-          toast.className = 'toast show ' + type;
-          setTimeout(() => toast.classList.remove('show'), 3000);
-        }
-      }
-
-      // 初始化检查
-      if (token) {
-        console.log('检测到已登录，自动进入控制面板');
-        document.getElementById('loginContainer').style.display = 'none';
-        document.getElementById('dashboard').style.display = 'block';
-        loadDashboard();
-        loadAccounts();
-        setInterval(loadDashboard, 30000); // 每30秒刷新
-      } else {
-        console.log('未检测到 token，显示登录界面');
       }
     }
-  </script>
-</body>
-</html>
-`;
-
-// ============================================================================
-// 其他路由
-// ============================================================================
-
-// 健康检查
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok' });
-});
-
-// 获取账号详情（用于编辑）
-app.get('/api/accounts/:id', authenticate, async (req, res) => {
-  const db = new Database();
-  await db.init();
-
-  try {
-    const account = await db.query('SELECT * FROM accounts WHERE id = ?', [req.params.id]);
-    if (account[0]) {
-      res.json(account[0]);
-    } else {
-      res.status(404).json({ error: '账号不存在' });
-    }
+    
+    res.json({ message: 'Account updated successfully' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error('Update account error:', error);
+    res.status(400).json({ message: error.message });
   }
 });
 
-// 首页
+// Delete account
+app.delete('/api/accounts/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    await db.execute('DELETE FROM login_history WHERE account_id = ?', [id]);
+    await db.execute('DELETE FROM accounts WHERE id = ?', [id]);
+    
+    scheduler.removeAccount(parseInt(id));
+    
+    res.json({ message: 'Account deleted successfully' });
+  } catch (error) {
+    console.error('Delete account error:', error);
+    res.status(400).json({ message: error.message });
+  }
+});
+
+// Manual login
+app.post('/api/login/manual/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    scheduler.executeLogin(parseInt(id));
+    res.json({ message: 'Manual login triggered' });
+  } catch (error) {
+    console.error('Manual login error:', error);
+    res.status(400).json({ message: error.message });
+  }
+});
+
+// Clear login history
+app.post('/api/login/clear', authenticateToken, async (req, res) => {
+  try {
+    const { type, ids } = req.body;
+    
+    if (type === 'selected' && ids && ids.length > 0) {
+      const placeholders = ids.map(() => '?').join(',');
+      await db.execute(`DELETE FROM login_history WHERE id IN (${placeholders})`, ids);
+    } else if (type === 'all') {
+      await db.execute('DELETE FROM login_history');
+      await db.execute('UPDATE accounts SET last_login_date = NULL');
+    }
+    
+    res.json({ message: 'Login history cleared' });
+  } catch (error) {
+    console.error('Clear history error:', error);
+    res.status(400).json({ message: error.message });
+  }
+});
+
+// Get notification settings
+app.get('/api/notification', authenticateToken, async (req, res) => {
+  try {
+    const settings = await db.query('SELECT * FROM notification_settings');
+    
+    const result = settings.map(s => ({
+      ...s,
+      config: dbType === 'sqlite' ? JSON.parse(s.config) : s.config
+    }));
+    
+    res.json(result);
+  } catch (error) {
+    console.error('Get notification settings error:', error);
+    res.status(500).json({ error: 'Failed to load settings' });
+  }
+});
+
+// Update notification settings
+app.put('/api/notification/:channel', authenticateToken, async (req, res) => {
+  try {
+    const { channel } = req.params;
+    const { enabled, config } = req.body;
+    
+    const configStr = dbType === 'mysql' ? config : JSON.stringify(config);
+    
+    await db.execute(
+      'UPDATE notification_settings SET enabled = ?, config = ?, updated_at = CURRENT_TIMESTAMP WHERE channel_type = ?',
+      [dbType === 'mysql' ? enabled : (enabled ? 1 : 0), configStr, channel]
+    );
+    
+    res.json({ message: 'Notification settings updated successfully' });
+  } catch (error) {
+    console.error('Update notification settings error:', error);
+    res.status(400).json({ message: error.message });
+  }
+});
+
+// Test notification
+app.post('/api/test/notification', authenticateToken, async (req, res) => {
+  try {
+    const { channel } = req.body;
+    
+    await NotificationService.sendNotification(
+      '测试通知',
+      '这是来自Netlib保活系统的测试通知。如果您收到此消息，说明您的通知设置正常工作！',
+      '系统测试',
+      [channel]
+    );
+    
+    res.json({ message: 'Test notification sent' });
+  } catch (error) {
+    console.error('Test notification error:', error);
+    res.status(400).json({ message: error.message });
+  }
+});
+
+// Serve HTML
 app.get('/', (req, res) => {
   res.send(HTML_TEMPLATE);
 });
 
-// ============================================================================
-// 启动服务
-// ============================================================================
-async function start() {
-  const db = new Database();
-  await db.init();
+// HTML Template (same as Python version, with minor adjustments)
+const HTML_TEMPLATE = `
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Netlib 保活控制面板</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif; 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+            min-height: 100vh;
+        }
+        
+        .login-container { 
+            display: flex; 
+            justify-content: center; 
+            align-items: center; 
+            min-height: 100vh; 
+            padding: 20px;
+        }
+        .login-box { 
+            background: white; 
+            padding: 40px; 
+            border-radius: 15px; 
+            box-shadow: 0 20px 60px rgba(0,0,0,0.2); 
+            width: 100%;
+            max-width: 400px;
+        }
+        .login-box h2 { 
+            margin-bottom: 30px; 
+            color: #333; 
+            text-align: center;
+        }
+        
+        .form-group { margin-bottom: 20px; }
+        .form-group label { 
+            display: block; 
+            margin-bottom: 8px; 
+            color: #555; 
+        }
+        .form-group input, .form-group textarea, .form-group select { 
+            width: 100%; 
+            padding: 12px; 
+            border: 2px solid #e0e0e0; 
+            border-radius: 8px; 
+            font-size: 14px;
+        }
+        .form-group input:focus, .form-group textarea:focus, .form-group select:focus { 
+            border-color: #667eea;
+            outline: none;
+        }
+        
+        .btn { 
+            padding: 12px 24px; 
+            background: linear-gradient(135deg, #667eea, #764ba2); 
+            color: white; 
+            border: none; 
+            border-radius: 8px; 
+            cursor: pointer; 
+            font-size: 14px; 
+        }
+        .btn:hover { transform: translateY(-2px); }
+        .btn-full { width: 100%; }
+        .btn-sm { padding: 8px 16px; font-size: 13px; }
+        .btn-danger { background: linear-gradient(135deg, #f56565, #e53e3e); }
+        .btn-success { background: linear-gradient(135deg, #48bb78, #38a169); }
+        
+        .dashboard { display: none; padding: 20px; background: #f7fafc; min-height: 100vh; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .header { 
+            background: white; 
+            padding: 20px 30px; 
+            border-radius: 15px; 
+            margin-bottom: 30px; 
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .stats-grid { 
+            display: grid; 
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); 
+            gap: 20px; 
+            margin-bottom: 30px; 
+        }
+        .stat-card { 
+            background: white; 
+            padding: 25px; 
+            border-radius: 15px; 
+        }
+        .stat-card h3 { color: #718096; font-size: 14px; margin-bottom: 12px; }
+        .stat-card .value { 
+            font-size: 32px; 
+            font-weight: bold; 
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        
+        .section { 
+            background: white; 
+            padding: 30px; 
+            border-radius: 15px; 
+            margin-bottom: 30px;
+        }
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 25px;
+        }
+        
+        .table { width: 100%; border-collapse: collapse; }
+        .table th, .table td { padding: 14px; text-align: left; border-bottom: 1px solid #e2e8f0; }
+        .table th { background: #f7fafc; font-weight: 600; }
+        .table tbody tr:hover { background: #f7fafc; }
+        
+        .badge { 
+            padding: 6px 12px; 
+            border-radius: 6px; 
+            font-size: 12px;
+            display: inline-block;
+        }
+        .badge-success { background: #c6f6d5; color: #22543d; }
+        .badge-danger { background: #fed7d7; color: #742a2a; }
+        
+        .switch { position: relative; display: inline-block; width: 50px; height: 26px; }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .slider { 
+            position: absolute; 
+            cursor: pointer; 
+            top: 0; left: 0; right: 0; bottom: 0; 
+            background-color: #cbd5e0; 
+            transition: .4s; 
+            border-radius: 26px; 
+        }
+        .slider:before { 
+            position: absolute; 
+            content: ""; 
+            height: 20px; width: 20px; 
+            left: 3px; bottom: 3px; 
+            background-color: white; 
+            transition: .4s; 
+            border-radius: 50%; 
+        }
+        input:checked + .slider { background: linear-gradient(135deg, #667eea, #764ba2); }
+        input:checked + .slider:before { transform: translateX(24px); }
+        
+        .modal { 
+            display: none; 
+            position: fixed; 
+            top: 0; left: 0; 
+            width: 100%; height: 100%; 
+            background: rgba(0,0,0,0.6); 
+            justify-content: center; 
+            align-items: center;
+            padding: 20px;
+        }
+        .modal-content { 
+            background: white; 
+            padding: 30px; 
+            border-radius: 15px; 
+            width: 100%;
+            max-width: 600px;
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+        .modal-header { 
+            margin-bottom: 25px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .close { 
+            font-size: 28px; 
+            cursor: pointer; 
+            color: #a0aec0;
+        }
+        
+        .toast {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: white;
+            padding: 16px 24px;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            display: none;
+            z-index: 2000;
+        }
+        .toast.success { border-left: 4px solid #48bb78; }
+        .toast.error { border-left: 4px solid #f56565; }
+    </style>
+</head>
+<body>
+    <div id="toast" class="toast"></div>
 
-  const service = new KeepAliveService();
-  service.start();
+    <div class="login-container" id="loginContainer">
+        <div class="login-box">
+            <h2>🔐 管理员登录</h2>
+            <div class="form-group">
+                <label>用户名</label>
+                <input type="text" id="username">
+            </div>
+            <div class="form-group">
+                <label>密码</label>
+                <input type="password" id="password">
+            </div>
+            <button class="btn btn-full" onclick="handleLogin()">登录</button>
+        </div>
+    </div>
 
-  app.listen(CONFIG.port, () => {
-    console.log(`🚀 控制面板启动: http://localhost:${CONFIG.port}`);
-    console.log(`📊 管理员账号: ${CONFIG.adminUsername}`);
-    console.log(`🔑 管理员密码: ${CONFIG.adminPassword}`);
-  });
-}
+    <div class="dashboard" id="dashboard">
+        <div class="container">
+            <div class="header">
+                <h1>📊 Netlib 保活控制面板</h1>
+                <button class="btn btn-danger btn-sm" onclick="logout()">退出</button>
+            </div>
 
-start().catch(console.error);
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <h3>账号总数</h3>
+                    <div class="value" id="totalAccounts">0</div>
+                </div>
+                <div class="stat-card">
+                    <h3>活跃账号</h3>
+                    <div class="value" id="activeAccounts">0</div>
+                </div>
+                <div class="stat-card">
+                    <h3>保活总数</h3>
+                    <div class="value" id="totalLogins">0</div>
+                </div>
+                <div class="stat-card">
+                    <h3>成功率</h3>
+                    <div class="value" id="successRate">0%</div>
+                </div>
+            </div>
+
+            <div class="section">
+                <div class="section-header">
+                    <h2>📅 今日保活记录</h2>
+                    <button class="btn btn-danger btn-sm" onclick="clearHistory('all')">清空所有</button>
+                </div>
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th><input type="checkbox" id="selectAll" onchange="toggleSelectAll()"></th>
+                            <th>账号</th>
+                            <th>状态</th>
+                            <th>消息</th>
+                            <th>时间</th>
+                        </tr>
+                    </thead>
+                    <tbody id="todayLogins"></tbody>
+                </table>
+                <button class="btn btn-danger btn-sm" onclick="deleteSelected()" style="margin-top: 10px;">删除选中</button>
+            </div>
+
+            <div class="section">
+                <div class="section-header">
+                    <h2>👥 账号管理</h2>
+                    <button class="btn btn-success btn-sm" onclick="showAddModal()">+ 添加账号</button>
+                </div>
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th>用户名</th>
+                            <th>状态</th>
+                            <th>Cron表达式</th>
+                            <th>通知渠道</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="accountsList"></tbody>
+                </table>
+            </div>
+
+            <div class="section">
+                <div class="section-header">
+                    <h2>🔔 通知设置</h2>
+                </div>
+                <div id="notificationSettings"></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal" id="addAccountModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>添加账号</h3>
+                <span class="close" onclick="closeModal('addAccountModal')">&times;</span>
+            </div>
+            <div class="form-group">
+                <label>用户名</label>
+                <input type="text" id="newUsername">
+            </div>
+            <div class="form-group">
+                <label>密码</label>
+                <input type="password" id="newPassword">
+            </div>
+            <div class="form-group">
+                <label>Cron表达式</label>
+                <input type="text" id="newCron" value="0 0 */60 * *">
+                <small>默认60天执行一次</small>
+            </div>
+            <div class="form-group">
+                <label>通知渠道</label>
+                <select multiple id="newChannels">
+                    <option value="telegram">Telegram</option>
+                    <option value="wechat">企业微信</option>
+                    <option value="wxpusher">WxPusher</option>
+                    <option value="dingtalk">钉钉</option>
+                </select>
+            </div>
+            <button class="btn btn-full" onclick="addAccount()">添加</button>
+        </div>
+    </div>
+
+    <script>
+        let authToken = localStorage.getItem('authToken');
+        
+        function showToast(message, type = 'info') {
+            const toast = document.getElementById('toast');
+            toast.className = \`toast \${type}\`;
+            toast.textContent = message;
+            toast.style.display = 'block';
+            setTimeout(() => toast.style.display = 'none', 3000);
+        }
+
+        async function handleLogin() {
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            
+            try {
+                const response = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password })
+                });
+
+                const data = await response.json();
+                if (response.ok) {
+                    authToken = data.token;
+                    localStorage.setItem('authToken', authToken);
+                    document.getElementById('loginContainer').style.display = 'none';
+                    document.getElementById('dashboard').style.display = 'block';
+                    loadDashboard();
+                } else {
+                    showToast(data.message, 'error');
+                }
+            } catch (error) {
+                showToast('登录失败', 'error');
+            }
+        }
+
+        function logout() {
+            localStorage.removeItem('authToken');
+            location.reload();
+        }
+
+        async function apiCall(url, options = {}) {
+            const response = await fetch(url, {
+                ...options,
+                headers: {
+                    'Authorization': 'Bearer ' + authToken,
+                    'Content-Type': 'application/json',
+                    ...options.headers
+                }
+            });
+
+            if (response.status === 401) {
+                logout();
+                return;
+            }
+
+            return await response.json();
+        }
+
+        async function loadDashboard() {
+            const data = await apiCall('/api/dashboard');
+            document.getElementById('totalAccounts').textContent = data.total_accounts;
+            document.getElementById('activeAccounts').textContent = data.enabled_accounts;
+            document.getElementById('totalLogins').textContent = data.total_logins;
+            document.getElementById('successRate').textContent = data.success_rate + '%';
+
+            const tbody = document.getElementById('todayLogins');
+            tbody.innerHTML = data.today_logins.map(login => \`
+                <tr>
+                    <td><input type="checkbox" class="login-checkbox" value="\${login.id}"></td>
+                    <td>\${login.username}</td>
+                    <td><span class="badge badge-\${login.success ? 'success' : 'danger'}">\${login.success ? '成功' : '失败'}</span></td>
+                    <td>\${login.message}</td>
+                    <td>\${new Date(login.created_at).toLocaleString()}</td>
+                </tr>
+            \`).join('');
+
+            loadAccounts();
+            loadNotificationSettings();
+        }
+
+        async function loadAccounts() {
+            const accounts = await apiCall('/api/accounts');
+            const tbody = document.getElementById('accountsList');
+            tbody.innerHTML = accounts.map(acc => \`
+                <tr>
+                    <td>\${acc.username}</td>
+                    <td>
+                        <label class="switch">
+                            <input type="checkbox" \${acc.enabled ? 'checked' : ''} onchange="toggleAccount(\${acc.id}, this.checked)">
+                            <span class="slider"></span>
+                        </label>
+                    </td>
+                    <td>\${acc.cron_expression}</td>
+                    <td>\${(acc.notification_channels || []).join(', ') || '-'}</td>
+                    <td>
+                        <button class="btn btn-success btn-sm" onclick="manualLogin(\${acc.id})">立即执行</button>
+                        <button class="btn btn-danger btn-sm" onclick="deleteAccount(\${acc.id})">删除</button>
+                    </td>
+                </tr>
+            \`).join('');
+        }
+
+        async function loadNotificationSettings() {
+            const settings = await apiCall('/api/notification');
+            const container = document.getElementById('notificationSettings');
+            
+            container.innerHTML = settings.map(s => \`
+                <div style="margin-bottom: 20px; padding: 20px; background: #f7fafc; border-radius: 10px;">
+                    <h4>\${s.channel_type}</h4>
+                    <label class="switch">
+                        <input type="checkbox" \${s.enabled ? 'checked' : ''} onchange="toggleNotification('\${s.channel_type}', this.checked)">
+                        <span class="slider"></span>
+                    </label>
+                    <button class="btn btn-sm" onclick="testNotification('\${s.channel_type}')">测试</button>
+                </div>
+            \`).join('');
+        }
+
+        async function toggleAccount(id, enabled) {
+            await apiCall(\`/api/accounts/\${id}\`, {
+                method: 'PUT',
+                body: JSON.stringify({ enabled })
+            });
+            loadAccounts();
+        }
+
+        async function deleteAccount(id) {
+            if (confirm('确定删除此账号吗？')) {
+                await apiCall(\`/api/accounts/\${id}\`, { method: 'DELETE' });
+                loadAccounts();
+            }
+        }
+
+        async function manualLogin(id) {
+            await apiCall(\`/api/login/manual/\${id}\`, { method: 'POST' });
+            showToast('保活任务已触发', 'success');
+        }
+
+        function showAddModal() {
+            document.getElementById('addAccountModal').style.display = 'flex';
+        }
+
+        function closeModal(id) {
+            document.getElementById(id).style.display = 'none';
+        }
+
+        async function addAccount() {
+            const username = document.getElementById('newUsername').value;
+            const password = document.getElementById('newPassword').value;
+            const cron_expression = document.getElementById('newCron').value;
+            const select = document.getElementById('newChannels');
+            const notification_channels = Array.from(select.selectedOptions).map(o => o.value);
+
+            await apiCall('/api/accounts', {
+                method: 'POST',
+                body: JSON.stringify({ username, password, cron_expression, notification_channels })
+            });
+            
+            closeModal('addAccountModal');
+            loadAccounts();
+        }
+
+        async function toggleNotification(channel, enabled) {
+            await apiCall(\`/api/notification/\${channel}\`, {
+                method: 'PUT',
+                body: JSON.stringify({ enabled, config: {} })
+            });
+        }
+
+        async function testNotification(channel) {
+            await apiCall('/api/test/notification', {
+                method: 'POST',
+                body: JSON.stringify({ channel })
+            });
+            showToast('测试通知已发送', 'info');
+        }
+
+        function toggleSelectAll() {
+            const checked = document.getElementById('selectAll').checked;
+            document.querySelectorAll('.login-checkbox').forEach(cb => cb.checked = checked);
+        }
+
+        async function deleteSelected() {
+            const ids = Array.from(document.querySelectorAll('.login-checkbox:checked')).map(cb => parseInt(cb.value));
+            if (ids.length === 0) return;
+            
+            if (confirm(\`确定删除选中的 \${ids.length} 条记录吗？\`)) {
+                await apiCall('/api/login/clear', {
+                    method: 'POST',
+                    body: JSON.stringify({ type: 'selected', ids })
+                });
+                loadDashboard();
+            }
+        }
+
+        async function clearHistory(type) {
+            if (confirm('确定清空所有记录吗？')) {
+                await apiCall('/api/login/clear', {
+                    method: 'POST',
+                    body: JSON.stringify({ type })
+                });
+                loadDashboard();
+            }
+        }
+
+        if (authToken) {
+            fetch('/api/verify', {
+                headers: { 'Authorization': 'Bearer ' + authToken }
+            }).then(response => {
+                if (response.ok) {
+                    document.getElementById('loginContainer').style.display = 'none';
+                    document.getElementById('dashboard').style.display = 'block';
+                    loadDashboard();
+                } else {
+                    logout();
+                }
+            });
+        }
+
+        document.getElementById('password').addEventListener('keypress', e => {
+            if (e.key === 'Enter') handleLogin();
+        });
+    </script>
+</body>
+</html>
+`;
+
+// Start application
+(async () => {
+  try {
+    await initDatabase();
+    await scheduler.start();
+    
+    app.listen(PORT, () => {
+      console.log(`\n✅ Netlib Keep-Alive Control Panel started`);
+      console.log(`📡 Server: http://localhost:${PORT}`);
+      console.log(`💾 Database: ${dbType.toUpperCase()}`);
+      console.log(`👤 Admin: ${ADMIN_USERNAME}`);
+      console.log(`\n🚀 System ready!\n`);
+    });
+  } catch (error) {
+    console.error('Failed to start application:', error);
+    process.exit(1);
+  }
+})();
