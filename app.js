@@ -758,6 +758,7 @@ const HTML_TEMPLATE = `
     .form-group { margin-bottom: 16px; }
     .form-group label { display: block; margin-bottom: 6px; font-size: 14px; }
     .form-group input { width: 100%; padding: 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 14px; }
+    .form-group select { width: 100%; padding: 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 14px; }
     .btn { padding: 12px 24px; border: none; border-radius: 6px; font-size: 14px; cursor: pointer; transition: all 0.2s; }
     .btn-primary { background: var(--primary); color: white; }
     .btn:hover { opacity: 0.9; }
@@ -855,7 +856,7 @@ const HTML_TEMPLATE = `
             <th>操作</th>
           </tr>
         </thead>
-        <tbody id="accountsBody"></tbody>
+        <tbody id="accountsBody">\${/* 数据将通过JS动态加载 */}</tbody>
       </table>
     </div>
 
@@ -870,7 +871,7 @@ const HTML_TEMPLATE = `
             <th>时间</th>
           </tr>
         </thead>
-        <tbody id="historyBody"></tbody>
+        <tbody id="historyBody">\${/* 数据将通过JS动态加载 */}</tbody>
       </table>
     </div>
   </div>
@@ -1059,14 +1060,14 @@ const HTML_TEMPLATE = `
         
         // 填充历史记录
         const tbody = document.getElementById('historyBody');
-        tbody.innerHTML = data.todayHistory?.map(h => `
+        tbody.innerHTML = data.todayHistory?.map(h => \`
           <tr>
-            <td>${h.account_name}</td>
-            <td><span style="color:${h.success?'var(--success)':'var(--danger)'}">${h.success?'成功':'失败'}</span></td>
-            <td>${h.message}</td>
-            <td>${new Date(h.created_at).toLocaleString()}</td>
+            <td>\${h.account_name}</td>
+            <td><span style="color:\${h.success?'var(--success)':'var(--danger)'}">\${h.success?'成功':'失败'}</span></td>
+            <td>\${h.message}</td>
+            <td>\${new Date(h.created_at).toLocaleString()}</td>
           </tr>
-        `).join('') || '<tr><td colspan="4">暂无记录</td></tr>';
+        \`).join('') || '<tr><td colspan="4">暂无记录</td></tr>';
       } catch (err) {
         console.error('加载仪表板失败:', err);
       }
@@ -1076,20 +1077,20 @@ const HTML_TEMPLATE = `
       try {
         const res = await API.get('/accounts');
         const tbody = document.getElementById('accountsBody');
-        tbody.innerHTML = res.data.map(a => `
+        tbody.innerHTML = res.data.map(a => \`
           <tr>
-            <td>${a.name}</td>
-            <td>${a.username}</td>
-            <td><span style="color:${a.enabled?'var(--success)':'var(--danger)'}">${a.enabled?'启用':'禁用'}</span></td>
-            <td>${a.cron_expression || `每${a.interval_minutes}分钟`}</td>
-            <td>${a.last_keepalive ? new Date(a.last_keepalive).toLocaleString() : '从未运行'}</td>
+            <td>\${a.name}</td>
+            <td>\${a.username}</td>
+            <td><span style="color:\${a.enabled?'var(--success)':'var(--danger)'}">\${a.enabled?'启用':'禁用'}</span></td>
+            <td>\${a.cron_expression || '每' + (a.interval_minutes || 60) + '分钟'}</td>
+            <td>\${a.last_keepalive ? new Date(a.last_keepalive).toLocaleString() : '从未运行'}</td>
             <td>
-              <button class="btn btn-primary btn-sm" onclick="manualKeepalive(${a.id})">立即执行</button>
-              <button class="btn btn-warning btn-sm" onclick="editAccount(${a.id})">编辑</button>
-              <button class="btn btn-danger btn-sm" onclick="deleteAccount(${a.id})">删除</button>
+              <button class="btn btn-primary btn-sm" onclick="manualKeepalive(\${a.id})">立即执行</button>
+              <button class="btn btn-warning btn-sm" onclick="editAccount(\${a.id})">编辑</button>
+              <button class="btn btn-danger btn-sm" onclick="deleteAccount(\${a.id})">删除</button>
             </td>
           </tr>
-        `).join('');
+        \`).join('');
       } catch (err) {
         console.error('加载账号失败:', err);
       }
@@ -1201,6 +1202,32 @@ const HTML_TEMPLATE = `
 </body>
 </html>
 `;
+
+// ============================================================================
+// 其他路由
+// ============================================================================
+
+// 健康检查
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok' });
+});
+
+// 获取账号详情（用于编辑）
+app.get('/api/accounts/:id', authenticate, async (req, res) => {
+  const db = new Database();
+  await db.init();
+
+  try {
+    const account = await db.query('SELECT * FROM accounts WHERE id = ?', [req.params.id]);
+    if (account[0]) {
+      res.json(account[0]);
+    } else {
+      res.status(404).json({ error: '账号不存在' });
+    }
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // 首页
 app.get('/', (req, res) => {
