@@ -1,25 +1,28 @@
 {
   "name": "netlib-keepalive",
   "version": "1.0.0",
-  "description": "Netlib Auto Login Keep-Alive Control Panel",
+  "description": "Netlib account keepalive system with web dashboard",
   "main": "app.js",
   "scripts": {
     "start": "node app.js",
     "dev": "nodemon app.js"
   },
-  "keywords": ["netlib", "keepalive", "automation"],
+  "keywords": [
+    "netlib",
+    "keepalive",
+    "automation"
+  ],
   "author": "",
   "license": "MIT",
   "dependencies": {
     "express": "^4.18.2",
-    "cors": "^2.8.5",
-    "jsonwebtoken": "^9.0.2",
-    "bcryptjs": "^2.4.3",
-    "node-cron": "^3.0.3",
+    "playwright": "^1.40.0",
     "axios": "^1.6.2",
-    "playwright": "^1.40.1",
     "mysql2": "^3.6.5",
-    "sqlite3": "^5.1.6"
+    "sqlite3": "^5.1.6",
+    "node-cron": "^3.0.3",
+    "cookie-parser": "^1.4.6",
+    "body-parser": "^1.20.2"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
