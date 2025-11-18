@@ -16,7 +16,7 @@ const PORT = process.env.PORT || 3000;
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
 const MYSQL_DNS = process.env.MYSQL_DNS;
-const MAX_RETRY = process.env.MYSQL_MAX_RETRY || 20;
+const MYSQL_MAX_RETRY = parseInt(process.env.MYSQL_MAX_RETRY || '20');
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 
 // 数据库连接
@@ -49,16 +49,17 @@ function parseMySQLDNS(dns) {
 }
 
 // 指数退避重试连接
-async function connectWithRetry(config, maxRetries = MAX_RETRY) {
+async function connectWithRetry(config, maxRetries = MYSQL_MAX_RETRY) {
   for (let i = 0; i < maxRetries; i++) {
     try {
       const pool = mysql.createPool(config);
       await pool.query('SELECT 1');
-      console.log('✅ MySQL 连接成功');
+      console.log(`✅ MySQL 连接成功 (尝试 ${i + 1}/${maxRetries})`);
       return pool;
     } catch (error) {
       const waitTime = Math.min(1000 * Math.pow(2, i), 30000);
       console.log(`⚠️ MySQL 连接失败 (尝试 ${i + 1}/${maxRetries}), ${waitTime}ms 后重试...`);
+      console.log(`   错误信息: ${error.message}`);
       
       if (i === maxRetries - 1) {
         throw new Error(`MySQL 连接失败，已重试 ${maxRetries} 次`);
@@ -75,6 +76,8 @@ async function initDatabase() {
     try {
       dbType = 'mysql';
       const config = parseMySQLDNS(MYSQL_DNS);
+      console.log(`🔄 正在连接 MySQL: ${config.host}:${config.port}/${config.database}`);
+      console.log(`   最大重试次数: ${MYSQL_MAX_RETRY}`);
       db = await connectWithRetry(config);
       
       // 创建表
@@ -124,6 +127,8 @@ async function initDatabase() {
         )
       `);
       
+      console.log('✅ MySQL 表初始化完成');
+      
     } catch (error) {
       console.error('❌ MySQL 初始化失败:', error.message);
       console.log('🔄 降级使用 SQLite');
@@ -132,7 +137,7 @@ async function initDatabase() {
   }
   
   if (dbType === 'sqlite') {
-    db = new sqlite3.Database('./netlib.db');
+    db = new sqlite3.Database('./data/netlib.db');
     const run = promisify(db.run.bind(db));
     
     await run(`
@@ -433,15 +438,28 @@ app.get('/api/stats', requireAuth, async (req, res) => {
     const [{ success_keepalives }] = await query('SELECT COUNT(*) as success_keepalives FROM keepalive_logs WHERE success = 1');
     
     // 最近7天的保活记录
-    const recentLogs = await query(`
-      SELECT DATE(created_at) as date, 
-             COUNT(*) as total,
-             SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as success
-      FROM keepalive_logs 
-      WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
-      GROUP BY DATE(created_at)
-      ORDER BY date DESC
-    `);
+    let recentLogs;
+    if (dbType === 'mysql') {
+      recentLogs = await query(`
+        SELECT DATE(created_at) as date, 
+               COUNT(*) as total,
+               SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as success
+        FROM keepalive_logs 
+        WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+        GROUP BY DATE(created_at)
+        ORDER BY date DESC
+      `);
+    } else {
+      recentLogs = await query(`
+        SELECT DATE(created_at) as date, 
+               COUNT(*) as total,
+               SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as success
+        FROM keepalive_logs 
+        WHERE created_at >= datetime('now', '-7 days')
+        GROUP BY DATE(created_at)
+        ORDER BY date DESC
+      `);
+    }
     
     res.json({
       total_accounts,
@@ -628,10 +646,10 @@ async function performKeepalive(account) {
   );
   
   // 更新最后保活时间
-  await execute(
-    'UPDATE accounts SET last_keepalive = NOW() WHERE id = ?',
-    [account.id]
-  );
+  const updateSql = dbType === 'mysql' 
+    ? 'UPDATE accounts SET last_keepalive = NOW() WHERE id = ?'
+    : 'UPDATE accounts SET last_keepalive = datetime("now") WHERE id = ?';
+  await execute(updateSql, [account.id]);
   
   // 发送通知
   await sendNotifications(result.message);
@@ -785,8 +803,7 @@ async function loadCronJobs() {
 
 // HTML 页面
 app.get('/', (req, res) => {
-  res.send(`
-<!DOCTYPE html>
+  const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
@@ -1469,20 +1486,20 @@ app.get('/', (req, res) => {
         const accounts = await res.json();
         
         const tbody = document.getElementById('accountsTableBody');
-        tbody.innerHTML = accounts.map(acc => `
+        tbody.innerHTML = accounts.map(acc => \`
           <tr>
-            <td>${acc.id}</td>
-            <td>${acc.username}</td>
-            <td><span class="badge ${acc.enabled ? 'badge-success' : 'badge-danger'}">${acc.enabled ? '启用' : '禁用'}</span></td>
-            <td>${acc.cron_expression}</td>
-            <td>${acc.last_keepalive || '从未'}</td>
+            <td>\${acc.id}</td>
+            <td>\${acc.username}</td>
+            <td><span class="badge \${acc.enabled ? 'badge-success' : 'badge-danger'}">\${acc.enabled ? '启用' : '禁用'}</span></td>
+            <td>\${acc.cron_expression}</td>
+            <td>\${acc.last_keepalive || '从未'}</td>
             <td>
-              <button class="btn btn-sm btn-primary" onclick="editAccount(${acc.id})"><i class="bi bi-pencil"></i></button>
-              <button class="btn btn-sm btn-success" onclick="manualKeepalive(${acc.id})"><i class="bi bi-play-circle"></i></button>
-              <button class="btn btn-sm btn-danger" onclick="deleteAccount(${acc.id})"><i class="bi bi-trash"></i></button>
+              <button class="btn btn-sm btn-primary" onclick="editAccount(\${acc.id})"><i class="bi bi-pencil"></i></button>
+              <button class="btn btn-sm btn-success" onclick="manualKeepalive(\${acc.id})"><i class="bi bi-play-circle"></i></button>
+              <button class="btn btn-sm btn-danger" onclick="deleteAccount(\${acc.id})"><i class="bi bi-trash"></i></button>
             </td>
           </tr>
-        `).join('');
+        \`).join('');
       } catch (error) {
         console.error('加载账号失败:', error);
       }
@@ -1535,7 +1552,7 @@ app.get('/', (req, res) => {
         const data = { username, cron_expression: cron, enabled };
         if (password) data.password = password;
         
-        const url = currentAccountId ? `/api/accounts/${currentAccountId}` : '/api/accounts';
+        const url = currentAccountId ? \`/api/accounts/\${currentAccountId}\` : '/api/accounts';
         const method = currentAccountId ? 'PUT' : 'POST';
         
         const res = await fetch(url, {
@@ -1562,7 +1579,7 @@ app.get('/', (req, res) => {
       if (!confirm('确定要删除此账号吗?')) return;
       
       try {
-        const res = await fetch(`/api/accounts/${id}`, { method: 'DELETE' });
+        const res = await fetch(\`/api/accounts/\${id}\`, { method: 'DELETE' });
         if (res.ok) {
           loadAccounts();
           alert('删除成功');
@@ -1577,7 +1594,7 @@ app.get('/', (req, res) => {
       if (!confirm('确定要手动执行保活吗?')) return;
       
       try {
-        const res = await fetch(`/api/keepalive/${id}`, { method: 'POST' });
+        const res = await fetch(\`/api/keepalive/\${id}\`, { method: 'POST' });
         const result = await res.json();
         alert(result.message || '保活完成');
         loadAccounts();
@@ -1593,16 +1610,16 @@ app.get('/', (req, res) => {
         const data = await res.json();
         
         const tbody = document.getElementById('logsTableBody');
-        tbody.innerHTML = data.logs.map(log => `
+        tbody.innerHTML = data.logs.map(log => \`
           <tr>
-            <td><input type="checkbox" class="log-checkbox" value="${log.id}"></td>
-            <td>${log.id}</td>
-            <td>${log.username}</td>
-            <td><span class="badge ${log.success ? 'badge-success' : 'badge-danger'}">${log.success ? '成功' : '失败'}</span></td>
-            <td>${log.message}</td>
-            <td>${log.created_at}</td>
+            <td><input type="checkbox" class="log-checkbox" value="\${log.id}"></td>
+            <td>\${log.id}</td>
+            <td>\${log.username}</td>
+            <td><span class="badge \${log.success ? 'badge-success' : 'badge-danger'}">\${log.success ? '成功' : '失败'}</span></td>
+            <td>\${log.message}</td>
+            <td>\${log.created_at}</td>
           </tr>
-        `).join('');
+        \`).join('');
       } catch (error) {
         console.error('加载日志失败:', error);
       }
@@ -1624,7 +1641,7 @@ app.get('/', (req, res) => {
         return;
       }
       
-      if (!confirm(`确定要删除 ${selected.length} 条日志吗?`)) return;
+      if (!confirm(\`确定要删除 \${selected.length} 条日志吗?\`)) return;
       
       try {
         const res = await fetch('/api/logs', {
@@ -1649,18 +1666,18 @@ app.get('/', (req, res) => {
         const channels = await res.json();
         
         const tbody = document.getElementById('notificationsTableBody');
-        tbody.innerHTML = channels.map(ch => `
+        tbody.innerHTML = channels.map(ch => \`
           <tr>
-            <td>${ch.name}</td>
-            <td>${ch.type}</td>
-            <td><span class="badge ${ch.enabled ? 'badge-success' : 'badge-danger'}">${ch.enabled ? '启用' : '禁用'}</span></td>
+            <td>\${ch.name}</td>
+            <td>\${ch.type}</td>
+            <td><span class="badge \${ch.enabled ? 'badge-success' : 'badge-danger'}">\${ch.enabled ? '启用' : '禁用'}</span></td>
             <td>
-              <button class="btn btn-sm btn-primary" onclick="editNotification(${ch.id})"><i class="bi bi-pencil"></i></button>
-              <button class="btn btn-sm btn-info" onclick="testNotification(${ch.id})"><i class="bi bi-send"></i></button>
-              <button class="btn btn-sm btn-danger" onclick="deleteNotification(${ch.id})"><i class="bi bi-trash"></i></button>
+              <button class="btn btn-sm btn-primary" onclick="editNotification(\${ch.id})"><i class="bi bi-pencil"></i></button>
+              <button class="btn btn-sm btn-info" onclick="testNotification(\${ch.id})"><i class="bi bi-send"></i></button>
+              <button class="btn btn-sm btn-danger" onclick="deleteNotification(\${ch.id})"><i class="bi bi-trash"></i></button>
             </td>
           </tr>
-        `).join('');
+        \`).join('');
       } catch (error) {
         console.error('加载通知渠道失败:', error);
       }
@@ -1681,7 +1698,7 @@ app.get('/', (req, res) => {
       const container = document.getElementById('notificationFields');
       
       const fields = {
-        telegram: `
+        telegram: \`
           <div class="mb-3">
             <label class="form-label">Bot Token</label>
             <input type="text" class="form-control" id="botToken" required>
@@ -1694,8 +1711,8 @@ app.get('/', (req, res) => {
             <label class="form-label">API 基础地址 (可选)</label>
             <input type="text" class="form-control" id="baseUrl" placeholder="https://api.telegram.org">
           </div>
-        `,
-        wechat: `
+        \`,
+        wechat: \`
           <div class="mb-3">
             <label class="form-label">Webhook Key</label>
             <input type="text" class="form-control" id="webhookKey" required>
@@ -1704,8 +1721,8 @@ app.get('/', (req, res) => {
             <label class="form-label">API 基础地址 (可选)</label>
             <input type="text" class="form-control" id="baseUrl" placeholder="https://qyapi.weixin.qq.com">
           </div>
-        `,
-        wxpusher: `
+        \`,
+        wxpusher: \`
           <div class="mb-3">
             <label class="form-label">App Token</label>
             <input type="text" class="form-control" id="appToken" required>
@@ -1718,8 +1735,8 @@ app.get('/', (req, res) => {
             <label class="form-label">API 基础地址 (可选)</label>
             <input type="text" class="form-control" id="baseUrl" placeholder="https://wxpusher.zjiecode.com">
           </div>
-        `,
-        dingtalk: `
+        \`,
+        dingtalk: \`
           <div class="mb-3">
             <label class="form-label">Access Token</label>
             <input type="text" class="form-control" id="accessToken" required>
@@ -1732,7 +1749,7 @@ app.get('/', (req, res) => {
             <label class="form-label">API 基础地址 (可选)</label>
             <input type="text" class="form-control" id="baseUrl" placeholder="https://oapi.dingtalk.com">
           </div>
-        `
+        \`
       };
       
       container.innerHTML = fields[type] || '';
@@ -1799,7 +1816,7 @@ app.get('/', (req, res) => {
       });
       
       try {
-        const url = currentNotificationId ? `/api/notifications/${currentNotificationId}` : '/api/notifications';
+        const url = currentNotificationId ? \`/api/notifications/\${currentNotificationId}\` : '/api/notifications';
         const method = currentNotificationId ? 'PUT' : 'POST';
         
         const res = await fetch(url, {
@@ -1824,7 +1841,7 @@ app.get('/', (req, res) => {
     // 测试通知
     async function testNotification(id) {
       try {
-        const res = await fetch(`/api/notifications/${id}/test`, { method: 'POST' });
+        const res = await fetch(\`/api/notifications/\${id}/test\`, { method: 'POST' });
         const result = await res.json();
         alert(result.success ? '测试消息发送成功' : '测试消息发送失败: ' + result.message);
       } catch (error) {
@@ -1837,7 +1854,7 @@ app.get('/', (req, res) => {
       if (!confirm('确定要删除此通知渠道吗?')) return;
       
       try {
-        const res = await fetch(`/api/notifications/${id}`, { method: 'DELETE' });
+        const res = await fetch(\`/api/notifications/\${id}\`, { method: 'DELETE' });
         if (res.ok) {
           loadNotifications();
           alert('删除成功');
@@ -1851,20 +1868,25 @@ app.get('/', (req, res) => {
     checkAuth();
   </script>
 </body>
-</html>
-  `);
+</html>`;
+  
+  res.send(html);
 });
 
 // 启动服务器
 async function start() {
   try {
+    console.log('\n===== Application Startup at ' + new Date().toLocaleString() + ' =====\n');
+    
     await initDatabase();
     await loadCronJobs();
     
     app.listen(PORT, () => {
-      console.log(`✅ 服务器启动成功: http://localhost:${PORT}`);
+      console.log(`\n✅ 服务器启动成功: http://localhost:${PORT}`);
       console.log(`📊 数据库类型: ${dbType.toUpperCase()}`);
       console.log(`👤 管理员账号: ${ADMIN_USERNAME}`);
+      console.log(`🔄 MySQL 最大重试次数: ${MYSQL_MAX_RETRY}`);
+      console.log('\n==========================================\n');
     });
   } catch (error) {
     console.error('❌ 启动失败:', error);
