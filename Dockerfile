@@ -1,53 +1,77 @@
-FROM node:18-slim
+# 使用多阶段构建减小镜像大小
+FROM mcr.microsoft.com/playwright:v1.40.0-jammy AS playwright
 
-# 安装依赖
-RUN apt-get update && apt-get install -y \
-    wget \
-    gnupg \
+# 阶段1: 构建阶段
+FROM node:18-alpine AS builder
+
+# 安装构建依赖
+RUN apk add --no-cache \
+    python3 \
+    make \
+    g++ \
+    chromium \
+    nss \
+    freetype \
+    harfbuzz \
     ca-certificates \
-    fonts-liberation \
-    libasound2 \
-    libatk-bridge2.0-0 \
-    libatk1.0-0 \
-    libatspi2.0-0 \
-    libcups2 \
-    libdbus-1-3 \
-    libdrm2 \
-    libgbm1 \
-    libgtk-3-0 \
-    libnspr4 \
-    libnss3 \
-    libwayland-client0 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxfixes3 \
-    libxkbcommon0 \
-    libxrandr2 \
-    xdg-utils \
-    libu2f-udev \
-    libvulkan1 \
-    && rm -rf /var/lib/apt/lists/*
+    ttf-freefont
 
-# 创建应用目录
 WORKDIR /app
 
-# 复制 package.json
+# 复制依赖文件
 COPY package*.json ./
 
-# 安装 Node.js 依赖
-RUN npm install --legacy-peer-deps
+# 安装npm依赖（包含Playwright）
+RUN npm install --only=production --legacy-peer-deps && \
+    npx playwright install chromium --with-deps && \
+    # 清理缓存减小体积
+    npm cache clean --force && \
+    rm -rf /root/.cache/ms-playwright/ffmpeg-*
 
-# 安装 Playwright 浏览器
-RUN npx playwright install chromium --with-deps
+# 阶段2: 最终运行镜像
+FROM node:18-alpine
+
+# 安装运行时依赖（精简）
+RUN apk add --no-cache \
+    chromium \
+    nss \
+    freetype \
+    harfbuzz \
+    ca-certificates \
+    ttf-freefont \
+    # 添加Playwright需要的额外库
+    libstdc++ \
+    libgcc \
+    dbus-glib \
+    nss-tools \
+    && rm -rf /var/cache/apk/*
+
+# 创建非root用户提升安全性
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S nodejs -u 1001
+
+# 设置环境变量
+ENV NODE_ENV=production \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+
+# 从builder阶段复制浏览器
+COPY --from=builder /root/.cache/ms-playwright /ms-playwright
 
 # 复制应用代码
-COPY app.js ./
+WORKDIR /app
+COPY --from=builder --chown=nodejs:nodejs /app/node_modules ./node_modules
+COPY --chown=nodejs:nodejs . .
 
 # 创建数据目录
-RUN mkdir -p /app/data
+RUN mkdir -p /app/data && \
+    chown -R nodejs:nodejs /app/data
 
 # 暴露端口
 EXPOSE 3000
+
+# 切换到非root用户
+USER nodejs
 
 # 健康检查
 HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
