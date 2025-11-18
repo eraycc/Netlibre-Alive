@@ -588,12 +588,9 @@ async function performKeepalive(account) {
   
   const browser = await chromium.launch({ 
   headless: true,
-  executablePath: process.env.PLAYWRIGHT_BROWSERS_PATH ? 
-    `/ms-playwright/chromium-*/chrome-linux/chrome` : 
-    undefined,
   args: [
     '--no-sandbox',
-    '--disable-setuid-sandbox',
+    '--disable-setuid-sandbox', 
     '--disable-dev-shm-usage',
     '--disable-gpu',
     '--disable-web-security'
