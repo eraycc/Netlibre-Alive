@@ -233,7 +233,7 @@ async function initTables() {
 
 // Express app setup
 const app = express();
-const PORT = parseInt(process.env.PORT || '8181');
+const PORT = parseInt(process.env.PORT || '3000');
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
